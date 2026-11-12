@@ -1,0 +1,350 @@
+# =====================================================================================================================
+# site_evaluation settings: every argument a run can set in nencarta, ARC, curve2flood and the FLDPLN library.
+#
+# Each argument has one line. The most common forms:
+#     Name: {value: 3}                                           fixed at 3
+#     Name: {value: 3, optimize: true, range: [1, 40]}           searched between 1 and 40; 3 is the default
+#     Name: {value: 3, optimize: false, range: [1, 40]}          fixed at 3 (flip optimize to search it)
+#
+# Fields of an argument
+#   value      Its default: what `site-eval run` uses, and what holds wherever it isn't searched. null leaves it out,
+#              so the tool's own default applies. It can differ by mapper or by DEM:
+#                  value: {fldpln: 3, kernel: 1}           value: {usgs: 0.003, other: 0.01}
+#   optimize   true: the optimizers search it. false, or missing: it stays at value. Per mapper:
+#              optimize: {fldpln: true, kernel: false}
+#   range      [low, high] for a number it is searched over. Add log: true to search on a log scale, and
+#              type: int for whole numbers (also inferred from an integer value).
+#   choices    The values a text or switch argument can take (a switch searches [false, true]).
+#   when       The switch it depends on. It is searched, and passed to its tool, only while that switch is on.
+#   mapper     fldpln or kernel: it is used with that mapper only (multipoint: curve2flood's multi-point mapper, which
+#              site-eval doesn't run).
+#   plausible  [low, high], the physically plausible band (Manning's n), for `site-eval show top --plausible`.
+#   screen     false: `site-eval sensitivity` leaves it out (fixed beforehand, for example on physical grounds; say why
+#              in a comment). Every other argument with an optimize field is screened over its range.
+#   from       (ARC lines) Set by a stand-in in `derived`. To set or search such an argument directly, replace `from`
+#              with a value (and a range), and set the stand-in's optimize to false.
+#
+# A parameter set (--params, the optimizers' trials, the archive) names arguments as written here. An argument whose
+# name appears in two sections is named <section>.<name>, for example curve2flood.compression.
+#
+# After changing anything under `nencarta` or `dem`, rebuild the cached preprocessing: site-eval prepare --mapper M.
+# Runs refuse a cache that was built with other nencarta settings.
+#
+# Comments show each tool's documentation (ARC: docs/model_input_file.md, curve2flood: docs/input_file.md, nencarta:
+# nencarta/core/defaults.py, FLDPLN library: curve2flood.build_fldpln_library).
+# =====================================================================================================================
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The DEM, and the cell size the metre-based stand-ins are converted with
+# ---------------------------------------------------------------------------------------------------------------------
+dem:
+  # Each site's DEMs/<name>.tif, scored on reference_warped/<name> inside boundary_rasters/<name>_boundary.tif:
+  # aster, aw3d30, copdem, fabdem, gedtm, nasadem, srtm or usgs (3DEP lidar).
+  name: fabdem
+  # How the *_m stand-ins become cells. nominal: the DEM's cell size from the table below. measured: each site's own
+  # (the geometric mean of a cell's width and height in metres; 23-31 m for a 1" DEM, depending on latitude).
+  cell_size: nominal
+  nominal_cell_size_m: {aster: 30, aw3d30: 30, copdem: 30, fabdem: 30, gedtm: 30, nasadem: 30, srtm: 30, usgs: 10}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Manning's n of each ESA WorldCover class (the table nencarta hands ARC)
+# ---------------------------------------------------------------------------------------------------------------------
+mannings_n:
+  n_tree:     {class: 10, label: Tree Cover, value: {fldpln: 0.1414213562373095, kernel: 0.1}, optimize: true, range: [0.065, 0.4], log: true}
+  n_shrub:    {class: 20, label: Shrubland, value: 0.05, optimize: false, range: [0.035, 0.4], log: true}
+  n_grass:    {class: 30, label: Grassland, value: {fldpln: 0.0565685424949238, kernel: 0.04}, optimize: true, range: [0.025, 0.4], log: true}
+  n_crop:     {class: 40, label: Cropland, value: {fldpln: 0.0565685424949238, kernel: 0.04}, optimize: true, range: [0.02, 0.5], log: true}
+  n_urban:    {class: 50, label: Builtup, value: {fldpln: 0.02697318745954566, kernel: 0.04415880433163923}, optimize: true, range: [0.01, 0.5], log: true}
+  n_bare:     {class: 60, label: Bare, value: 0.03, optimize: false, range: [0.01, 0.13], log: true}
+  n_snow:     {class: 70, label: SnowIce, value: 0.03, optimize: false, range: [0.01, 0.03], log: true}
+  # The channel: ARC gives the stream cells and the channel between its banks the water class's n.
+  n_water:    {class: 80, label: Water, value: {fldpln: 0.05117773119963173, kernel: 0.03741657386773942}, optimize: true, range: [0.01, 0.05], log: true}
+  n_wetland:  {class: 90, label: Emergent_Herb_Wet, value: 0.1, optimize: false, range: [0.05, 0.15], log: true}
+  n_mangrove: {class: 95, label: Mangroves, value: 0.1, optimize: false, range: [0.08, 0.2], log: true}
+  n_moss:     {class: 100, label: MossLichen, value: 0.1, optimize: false, range: [0.025, 0.05], log: true}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Stand-ins: searched in place of the ARC arguments they set (the ARC lines marked `from`)
+# ---------------------------------------------------------------------------------------------------------------------
+derived:
+  # Cross-section rotation. ARC turns each cross section by 0, ±interval, ... up to ±Degree_Manip/2 to find where the
+  # valley is narrowest. On: Degree_Manip = 2 × rot_half_width, Degree_Interval = rot_half_width / rot_steps.
+  # Off: Degree_Manip 0, Degree_Interval 1.
+  rotate:          {value: {fldpln: false, kernel: true}, optimize: true}
+  rot_half_width:  {value: {fldpln: 10.0, kernel: 0.5}, optimize: true, range: [0.5, 45.0], when: rotate}   # degrees
+  rot_steps:       {value: {fldpln: 1, kernel: 7}, optimize: true, range: [1, 8], when: rotate}
+
+  # Depth-varying n: n(h) = n × (1 + (dvn_shallow − 1) / (1 + k h)), with dvn_L = (dvn_shallow − 1) / k the depth
+  # scale (m). On: Depth_Varying_N true, shallow_factor = dvn_shallow, deep_factor 1, k_decay = (dvn_shallow − 1) / dvn_L.
+  # Off: Depth_Varying_N false (and the other three left out).
+  dvn:             {value: false, optimize: true}
+  dvn_shallow:     {value: 2.0, optimize: true, range: [1.0, 10.0], log: true, when: dvn}
+  dvn_L:           {value: 0.2, optimize: true, range: [0.02, 2.0], log: true, when: dvn}
+
+  # The channel depth's drainage-area power law. On: coefficient_depth and exponent_depth from the two lines below
+  # (depth m = coefficient × area_km2 ^ exponent; nencarta's former law), which set the bathymetry's depth instead of
+  # the bankfull flow. Off: both left out.
+  power_depth:            {value: false, optimize: true}
+  depth_law_coefficient:  {value: 0.27, optimize: false, range: [0.05, 2.0], log: true, when: power_depth}
+  depth_law_exponent:     {value: 0.21, optimize: false, range: [0.1, 0.6], when: power_depth}
+
+  # ARC's slope and direction windows, in metres along the stream rather than cells, so a value means the same on
+  # every DEM: Gen_Slope_Dist and Gen_Dir_Dist = round(metres / cell size), at least 1 (cell size: see `dem`).
+  Gen_Slope_Dist_m: {value: {fldpln: 90.0, kernel: 30.0}, optimize: true, range: [30.0, 1200.0], log: true}
+  Gen_Dir_Dist_m:   {value: {fldpln: 60.0, kernel: 960.0}, optimize: true, range: [30.0, 1200.0], log: true}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# nencarta. These shape the cached preprocessing, so they can't be optimized: change one, then `site-eval prepare`.
+# site-eval sets these itself for each site: name, output_dir, dem, flowline, reanalysis_file (flow_files/bm.csv),
+# user_flow_files (the stage files), mannings_text_file (from mannings_n), mapper, arc_args, curve2flood_args,
+# fldpln_library_args, floodmap_mode (user), and specified_bathyflow_field: bankfull when ARC's Bathy_Use_Banks is
+# true, otherwise baseflow (Ricky, 2026-11-10).
+# ---------------------------------------------------------------------------------------------------------------------
+nencarta:
+  # --- DEMs ---
+  dem_dir: {value: null}                          # a folder of DEMs, each mapped on its own
+  dem_filter: {value: "*"}                        # file pattern that picks the DEMs in dem_dir
+  source_dems: {value: []}                        # DEMs to cut the domain's DEM from, with bbox or buffer
+  bbox: {value: null}                             # area to map, [minx, miny, maxx, maxy] in degrees
+  buffer: {value: false}                          # map a larger area from source_dems, then crop back to the DEM
+  buffer_distance: {value: 0.1}                   # how far buffer grows the DEM (degrees)
+  use_vrt: {value: false}                         # write the domain's DEM as a VRT instead of a GeoTIFF
+  project_to_utm: {value: false}                  # project a DEM cut from source_dems to its UTM zone
+  use_warning_flags_to_download_dem: {value: false}   # download USGS DEMs where GEOGLOWS forecasts floods
+  geoglows_vpu: {value: null}                     # GEOGLOWS V2 VPU for the option above
+
+  # --- Streams ---
+  source_flowlines: {value: []}                   # stream networks to take the domain's streams from
+  stream_id_field: {value: null}                  # reach ID attribute (default LINKNO for GEOGLOWS)
+  downstream_id_field: {value: null}              # downstream reach ID attribute (default DSLINKNO for GEOGLOWS)
+  StrmOrder_Field: {value: "strmOrder"}           # stream order attribute
+  StrmOrder_Lower: {value: null}                  # map only reaches of at least this order (not FLDPLN)
+  StrmOrder_Upper: {value: null}                  # map only reaches of at most this order (not FLDPLN)
+  exclude: {value: []}                            # IDs of reaches to leave out
+  drop_multilinestrings: {value: false}           # leave out reaches whose line is in several pieces
+  lake_filter_json: {value: null}                 # GEOGLOWS JSON of the reaches inside lakes, left out
+  lakes: {value: "~/data/all_lakes_filtered_trimmed_tiled.parquet"}   # lakes: kept out of burned channels, cut the moved network
+  ocean: {value: null}                            # ocean polygons: streams end where they reach the sea
+  move_stream_network_to_thalweg: {value: true}   # move each reach onto the DEM's flow path (FLDPLN needs it)
+  new_strm_threshold_km2: {value: 1}              # smallest drainage area (km2) of the flow paths reaches move onto
+  burn_streams: {value: true}                     # burn the streams into the DEM before mapping
+  relocate_misplaced_streams: {value: true}       # first move reaches the DEM shows are off their river
+  use_dem_derived_channel_mask: {value: true}     # find the channel the DEM shows; smooth its flattened water; add it to the water mask
+  # Whether the DEM flattens every river wide enough to show, as FABDEM does (yes), or only some of its water, as
+  # USGS 3DEP (no). auto: nencarta decides from the DEM. FABDEM is yes (Ricky).
+  dem_flattens_rivers: {value: {fabdem: "yes", usgs: "no", other: "auto"}, choices: ["auto", "yes", "no"]}
+  streams_as_parquet: {value: false}              # write stream networks as GeoParquet instead of GeoPackage
+  minimize_output_files: {value: false}           # delete the source and relocated streams once moved
+
+  # --- Flows ---
+  streamflow_source: {value: "GEOGLOWS", choices: ["GEOGLOWS", "GEOGLOWS_V2", "NWM_short_range", "NWM_medium_range", "NWM_long_range", "CUSTOM"]}
+  nwm_api_key: {value: null}                      # NWM API key (NWM sources)
+  return_periods: {value: []}                     # return periods to map in return_period mode
+  return_period_file: {value: null}               # return period flows to use instead of GEOGLOWS'
+  return_period_variables: {value: null}          # variables of that dataset to read
+  include_fdc: {value: true}                      # add flow duration curve flows (p_exceed_*) to the statistics
+  fdc_file: {value: null}                         # flow duration curves to use instead of GEOGLOWS'
+  fdc_variable: {value: null}                     # variable of that dataset to read
+  reanalysis_storage_options: {value: null}       # fsspec options for a remote return_period_file or fdc_file
+  raise_errors_if_river_ids_missing: {value: true}    # stop if reaches are missing from the flow datasets
+  specified_highflow_field: {value: "max"}        # bm.csv column of the highest flow the rating curves cover
+  q_baseflow_threshold: {value: null}             # leave out reaches whose baseflow is below this (m3/s)
+
+  # --- Forecasts ---
+  forensic_forecast_date: {value: null}           # map the forecast issued on this date (YYYYMMDD)
+  forensic_forecast_hour: {value: null}           # hour (UTC) of a past NWM forecast
+  remove_old_forecast_files: {value: false}       # delete forecast maps once age_of_forecast_days old
+  age_of_forecast_days: {value: 7}
+
+  # --- Land cover ---
+  land_cover_cache: {value: []}                   # local ESA WorldCover tiles to use instead of downloading
+  land_watervalue: {value: 80}                    # land cover value of open water (80 in ESA WorldCover)
+
+  # --- Bathymetry ---
+  disable_bathymetry: {value: false}              # skip bathymetry, map on the DEM as it is
+  clean_dem: {value: false}                       # smooth the stream channels with the DEM cleaner first
+  use_specified_depth_for_bathy_mask: {value: false}  # give ARC the streams flooded to a set depth instead of the water mask
+  specify_depths_for_bathy_mask: {value: [0.1]}   # those depths (m)
+  depth_mask_distance: {value: 2000.0}            # how far (m) the set-depth floods average the stream's water out to
+  area_km2_field: {value: "DSContArea_km2"}       # drainage area (km2) attribute, for ARC's power laws
+  area_m2_field: {value: "DSContArea"}            # drainage area (m2) attribute, used when the km2 one is missing
+  outlet_exchange: {value: "off", choices: ["off", "pass1", "pass2"]}  # neighbouring DEMs' water at outlets (buffered DEMs)
+  outlet_exchange_dir: {value: null}
+
+  # --- Outputs ---
+  make_vdt: {value: true}                         # ARC's VDT database (the mappers read it)
+  make_curvefile: {value: false}                  # ARC's curve file
+  make_ap_database: {value: false}                # ARC's area-perimeter database
+  make_cross_section_file: {value: false}         # ARC's cross sections
+  make_representative_cross_section_file: {value: false}
+  vdt_file_extension: {value: "parquet", choices: ["txt", "csv", "parquet"]}
+  make_depth_maps: {value: false}
+  make_velocity_maps: {value: false}
+  make_wse_maps: {value: false}
+  floodmap_identifier: {value: ""}                # text added to the flood map file names
+  overwrite_floodmaps: {value: true}
+  make_fist_inputs: {value: false}                # FIST inputs (needs make_curvefile)
+  estimate_consequences: {value: false}           # Go-Consequences damages (Docker, CONUS)
+  folder_paths: {value: null}                     # where each output folder goes
+  short_file_names: {value: false}                # drop the <source>_<DEM>_ prefix from file names
+  file_names: {value: null}                       # new names for kinds of output files
+  use_parquet: {value: true}                      # the FLDPLN stream info table as Parquet
+  use_yaml: {value: true}                         # ARC and curve2flood input files as YAML
+  compression: {value: "LZW"}                     # compression of the rasters nencarta writes
+
+  # --- Running ---
+  overwrite: {value: false}                       # remake intermediate files that exist
+  parallel: {value: false}                        # process the DEMs in parallel (site-eval runs one per worker)
+  num_workers: {value: null}
+  profile: {value: false}                         # print how long each step took
+  quiet: {value: true}                            # hide ARC and curve2flood progress output
+  raise_errors_if_nothing_in_domain: {value: true}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# ARC (arc_args). nencarta sets these itself, so they aren't listed: DEM_File, Stream_File, StrmShp_File, Flow_File,
+# Flow_File_ID, Flow_File_BF, Flow_File_QMax, LU_Raster_SameRes, LU_Manning_n, LC_Water_Value, BathyWaterMask,
+# reach_id, downstream_reach_id, drainage_area_field, Print_VDT_Database, Print_Curve_File, Print_AP_Database,
+# XS_Out_File, Build_Representative_Cross_Section, Representative_Cross_Section_File, BATHY_Out_File, Outlet_WSE_File.
+# ---------------------------------------------------------------------------------------------------------------------
+arc:
+  # --- Cross sections and slopes ---
+  Gen_Dir_Dist: {from: Gen_Dir_Dist_m}            # cells each way to fit the stream's direction to
+  Gen_Slope_Dist: {from: Gen_Slope_Dist_m}        # cells each way the slope methods use
+  Degree_Manip: {from: rotate}                    # range of angles (degrees) the cross section turns through
+  Degree_Interval: {from: rotate}                 # step between those angles (degrees)
+  # Points either side of the stream cell to look for lower ground (0: off). nencarta's default is 2; the streams are
+  # moved onto the DEM's flow paths, so 0.
+  Low_Spot_Range: {value: 0, optimize: false, range: [0, 5]}
+  # Kept fixed (Ricky).
+  Stream_Slope_Method: {value: "local_average_corrected", optimize: false, screen: false, choices: ["local_average", "local_average_corrected", "reach_average", "end_points", "local_fit"]}
+  # The percentiles of a reach's slopes reach_average and local_average_corrected work between (ARC's 5/95; nencarta's 25/75).
+  Slope_Low_Percentile: {value: 5, optimize: false, range: [0, 50]}
+  Slope_High_Percentile: {value: 95, optimize: false, range: [50, 100]}
+  # Overbanks from lines square to the valley, at the valley's slope (kept fixed, Ricky).
+  Valley_Sections: {value: true, optimize: false, screen: false}
+  Valley_Dir_Widths: {value: 16.0, optimize: false, range: [4.0, 40.0], when: Valley_Sections}   # channel widths each way for the valley's direction
+  Valley_Dir_Dist: {value: 40, optimize: false, range: [2, 120], when: Valley_Sections}           # cells each way, where a reach has no width
+  Subcell_Channels: {value: {fldpln: false, kernel: true}, optimize: true}   # rebuild channels under 10 cells across below the cell scale
+  Drop_Edge_Sections: {value: false, optimize: false}    # drop cross sections whose water reaches the raster's edge
+  Edge_Margin: {value: 0.0, optimize: false, range: [0.0, 500.0], when: Drop_Edge_Sections}   # metres
+  Manual_Cross_Sections_File: {value: null}       # cross sections to use instead of sampling the DEM
+
+  # --- Roughness and discharge ---
+  Depth_Varying_N: {from: dvn}
+  k_decay: {from: dvn}
+  shallow_factor: {from: dvn}
+  deep_factor: {from: dvn}
+  # Multiplies every conveyance (Q = K √S f): exactly the same maps as dividing every n by it (checked 2026-11-12,
+  # max |dMCC| 0.0 at six sites), so it duplicates a common multiplier on the n values.
+  slope_adjustment_factor: {value: 1.0, optimize: false, screen: false, range: [0.5, 2.0], log: true}
+  # Water surfaces by the standard-step method along the network, not each section's normal depth (kept fixed, Ricky).
+  Standard_Step: {value: true, optimize: false, screen: false}
+  Standard_Step_Eddy_Length: {value: 300.0, optimize: false, range: [0.0, 1000.0], when: Standard_Step}   # metres downstream for the eddy loss
+
+  # --- Bathymetry ---
+  # true: the banks are the bank tops and the bankfull flow fills the channel to them; false: the DEM's water surface
+  # carries the baseflow. Sets nencarta's specified_bathyflow_field (bankfull or baseflow). true (Ricky).
+  Bathy_Use_Banks: {value: true, optimize: false, screen: false}
+  Bathy_Trap_H: {value: {fldpln: 0.0, kernel: 0.43875476549804865}, optimize: true, range: [0.0, 0.5]}   # trapezoid side share of the top width
+  Bathy_Smooth_Banks: {value: true, optimize: false}     # smooth each reach's channel widths and bank elevations
+  Bathy_Smooth_Bed: {value: null, choices: [true, false]}   # null: ARC decides (off with Standard_Step or Bathy_Use_Banks)
+  Bathy_Bed_Cap: {value: false, optimize: false}         # hold the bed to ±0.5 m per m (does nothing with the standard step and banks)
+  Bathy_Bankless_Max_Baseflow: {value: 20.0, optimize: false, range: [0.0, 100.0]}   # m3/s; ARC's default (Ricky, 2026-10-28)
+  FindBanksBasedOnLandCover: {value: false, optimize: false}   # nencarta always gives ARC the water mask
+  coefficient_depth: {from: power_depth}
+  exponent_depth: {from: power_depth}
+  # The channel width's drainage-area power law (width m = coefficient × area_km2 ^ exponent): nencarta's, for the
+  # channels whose banks no mask or DEM shows.
+  coefficient_width: {value: 2.44, optimize: false, range: [0.5, 10.0], log: true}
+  exponent_width: {value: 0.34, optimize: false, range: [0.2, 0.6]}
+
+  # --- Rating curves and outputs ---
+  VDT_Database_NumIterations: {value: 30, optimize: false, range: [10, 60]}   # flows per rating curve
+  Reach_Average_Curve_File: {value: false}
+  Print_Decision_Log: {value: null}               # a table of what each step decided for each stream cell
+  Log_File: {value: null}
+  Compression: {value: null}                      # ARC's raster compression (default ZSTD)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# curve2flood (curve2flood_args). nencarta sets: DEM_File, Print_VDT_Database, Print_Curve_File, COMID_Flow_File,
+# Stream_File, LU_Raster_SameRes, LU_Manning_n, LAND_WaterValue, OutFLD, OutDEP, OutWSE, OutVEL, mapper, Set_Depth,
+# Flow_Direction_File, Stream_Info_File, FLDPLN_Library, BathyWaterMask, BATHY_Out_File, FSOutBATHY, Bathy_Use_Banks.
+# ---------------------------------------------------------------------------------------------------------------------
+curve2flood:
+  Make_Output_GPKG: {value: false}                # also write the flood extent as polygons
+  compression: {value: null}                      # the maps' compression (default LZW)
+  # Always flood the stream cells and the land cover's water cells (on since 2026-11-11: +0.004 FLDPLN, +0.002 kernel).
+  Flood_WaterLC_and_STRM_Cells: {value: true, optimize: false}
+  Flood_Bathy_Mask: {value: true, optimize: false}    # always flood the water mask's cells
+
+  # --- Kernel-weighted mapper ---
+  TW_MultFact: {value: 3.914795792533067, optimize: true, range: [0.1, 10.0], log: true, mapper: kernel}   # multiplies every top width
+  TopWidthPlausibleLimit: {value: 6166.742575746264, optimize: true, range: [300.0, 10000.0], log: true, mapper: kernel}   # widest top width (m)
+  LocalFloodOption: {value: false, optimize: false, mapper: kernel}   # a stream cell's water reaches only cells connected to it
+
+  # --- FLDPLN mapper ---
+  FLDPLN_Min_Flood_Depth: {value: 0.18399071593792604, optimize: true, range: [0.001, 1.0], log: true, mapper: fldpln}   # shallowest water (m) that floods a cell
+
+  # --- Multi-point interpolation mapper (not run by site-eval) ---
+  MPI_TopWidth_Threshold_m: {value: 200.0, mapper: multipoint}
+  MPI_XS_Point_Spacing_m: {value: 100.0, mapper: multipoint}
+  MPI_Remove_HWM_Outliers: {value: true, mapper: multipoint}
+  MPI_HWM_Outlier_Method: {value: "mad", choices: ["mad", "iqr"], mapper: multipoint}
+  MPI_HWM_Outlier_Threshold: {value: 3.5, mapper: multipoint}
+  MPI_HWM_Outlier_Group_By: {value: "comid", choices: ["comid", "global"], mapper: multipoint}
+  MPI_HWM_Outlier_Min_Samples: {value: 5, mapper: multipoint}
+  MPI_Use_TopWidth_Buffers: {value: true, mapper: multipoint}
+  MPI_Corridor_TopWidth_Factor: {value: 1.0, mapper: multipoint}
+  MPI_Anchor_TopWidth_Factor: {value: 0.1, mapper: multipoint}
+  MPI_Corridor_Buffer_m: {value: 500.0, mapper: multipoint}
+  MPI_Anchor_Buffer_m: {value: 5.0, mapper: multipoint}
+  MPI_K: {value: 12, mapper: multipoint}
+  MPI_Power: {value: 2.0, mapper: multipoint}
+  MPI_Use_TopWidth_Max_Distance: {value: true, mapper: multipoint}
+  MPI_MaxDist_TopWidth_Factor: {value: 1.0, mapper: multipoint}
+  MPI_Max_Distance_m: {value: 1000.0, mapper: multipoint}
+  MPI_Min_TopWidth_m: {value: 5.0, mapper: multipoint}
+  MPI_Max_TopWidth_m: {value: 500.0, mapper: multipoint}
+  MPI_Fallback_TopWidth_m: {value: 20.0, mapper: multipoint}
+  MPI_Smooth_Sigma_Pixels: {value: 0.25, mapper: multipoint}
+  MPI_Apply_WSE_Sanity_Filter: {value: true, mapper: multipoint}
+  MPI_WSE_Sanity_Tolerance_m: {value: 0.0, mapper: multipoint}
+  MPI_Connectivity: {value: 4, choices: [4, 8], mapper: multipoint}
+  MPI_Fast_Mode: {value: false, mapper: multipoint}
+  MPI_One_Based_VDT_RC: {value: false, mapper: multipoint}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The FLDPLN library (fldpln_library_args: curve2flood.build_fldpln_library), FLDPLN mapper only. nencarta sets: dem,
+# filled_dem, stream_info_file, flow_direction_file, library_file, vdt_file, bg_mask, water_mask, pbar.
+# ---------------------------------------------------------------------------------------------------------------------
+fldpln_library:
+  # Head (m) a spill loses per pixel down its path: 0.01 per 30 m cell on FABDEM (Ricky, 2026-10-22), the same
+  # 0.33 m/km on 10 m lidar.
+  spill_decay: {value: {usgs: 0.003, other: 0.01}, optimize: false, range: [0.0, 0.1], mapper: fldpln}
+  solver: {value: "iterative", optimize: false, choices: ["iterative", "exact"], mapper: fldpln}
+  # Iterative solver: the least depth (m) a flooded pixel counts as when deciding where a spill stops.
+  fldmn: {value: 0.2715658348459931, optimize: true, range: [0.01, 1.0], log: true, mapper: fldpln}
+  dh: {value: 0.5, optimize: false, range: [0.1, 1.0], mapper: fldpln}            # depth step of the iterative solver (m)
+  fldmx: {value: 25.0, optimize: false, range: [5.0, 50.0], mapper: fldpln}        # largest depth to flood to (m)
+  iterative_spill: {value: false, optimize: false, mapper: fldpln}                 # keep spilling until the floodplain stops growing
+  max_reach_length: {value: 5000.0, optimize: false, range: [500.0, 20000.0], log: true, mapper: fldpln}   # longest segment (m)
+  max_profile_deviation: {value: 1.0, optimize: false, range: [0.1, 5.0], log: true, mapper: fldpln}       # cut reaches where the bed bends more than this (m)
+  max_cells_per_segment: {value: null, mapper: fldpln}   # most rows a segment may contribute (exact solver)
+  global_max_wse: {value: 0.0, mapper: fldpln}           # highest water surface allowed (0: no limit)
+  bg: {value: -9999, mapper: fldpln}                     # no-data value of the filled DEM
+  parallel: {value: false, mapper: fldpln}               # solve several segments at once
+  processes: {value: null, mapper: fldpln}
+  stream_ids: {value: null, mapper: fldpln}              # only build these segments
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Per-site tuning (site-eval optimize persite): each site searched on its own, as deviations from the general set
+# (the defaults above, or --base). `scales` makes a multiplier of the listed parameters, searched over its range; any
+# other line names a parameter above, searched over its own range unless one is given here.
+# ---------------------------------------------------------------------------------------------------------------------
+persite:
+  fp_mult: {scales: [n_tree, n_grass, n_crop, n_urban], range: [0.2, 5.0], log: true, optimize: true}   # floodplain roughness
+  ch_mult: {scales: [n_water], range: [0.2, 5.0], log: true, optimize: true}                            # channel roughness
+  FLDPLN_Min_Flood_Depth: {optimize: true, mapper: fldpln}
+  TW_MultFact: {optimize: true, mapper: kernel}
+  Bathy_Trap_H: {optimize: true}
+  Gen_Slope_Dist_m: {optimize: false}

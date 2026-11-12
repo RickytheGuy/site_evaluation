@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "site-evaluation"
+version = "0.1.0"
+description = "Run, score and calibrate nencarta (ARC + curve2flood) flood maps on the USGS FIM benchmark sites"
+readme = "README.md"
+requires-python = ">=3.11"
+# nencarta, arc and curve2flood come from their repos (editable installs), GDAL from conda
+dependencies = [
+    "numpy", "pandas", "matplotlib", "scipy", "scikit-learn", "optuna", "cma", "geopandas", "pyarrow",
+]
+
+[project.scripts]
+site-eval = "site_evaluation.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+site_evaluation = ["presets/*.json"]

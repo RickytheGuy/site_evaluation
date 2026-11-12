@@ -1,0 +1,20 @@
+{
+ "n_tree": 0.1414213562373095,
+ "n_grass": 0.0565685424949238,
+ "n_crop": 0.0565685424949238,
+ "n_urban": 0.02697318745954566,
+ "n_water": 0.05117773119963173,
+ "rotate": false,
+ "rot_half_width": 10.0,
+ "rot_steps": 1,
+ "Gen_Slope_Dist": 3,
+ "Gen_Dir_Dist": 2,
+ "Bathy_Trap_H": 0.0,
+ "dvn": false,
+ "power_depth": false,
+ "subcell": false,
+ "min_flood_depth": 0.18399071593792604,
+ "fldmn": 0.2715658348459931,
+ "dvn_shallow": 2.0,
+ "dvn_L": 0.20000000000000007
+}

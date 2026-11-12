@@ -1,0 +1,20 @@
+{
+ "n_tree": 0.1,
+ "n_grass": 0.04,
+ "n_crop": 0.04,
+ "n_urban": 0.04415880433163923,
+ "n_water": 0.03741657386773942,
+ "rotate": true,
+ "rot_half_width": 0.5,
+ "rot_steps": 7,
+ "Gen_Slope_Dist": 1,
+ "Gen_Dir_Dist": 32,
+ "Bathy_Trap_H": 0.43875476549804865,
+ "dvn": false,
+ "power_depth": false,
+ "subcell": true,
+ "TW_MultFact": 3.914795792533067,
+ "TW_limit": 6166.742575746264,
+ "dvn_shallow": 2.0,
+ "dvn_L": 0.2
+}
