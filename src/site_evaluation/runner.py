@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import config, params, pipeline, scoring, settings, sites
+from . import config, params, pipeline, progress, scoring, settings, sites
 
 _SLOT: Path | None = None
 _SLOT_LOCK = None
@@ -50,6 +50,7 @@ def _init_worker(mapper: str, settings_path: str) -> None:
     global _SLOT
     import sys
     import warnings
+    progress.worker_init()                   # Ctrl-C is the main process's; exit when it does
     sys.stdout = open(os.devnull, "w")       # nencarta's progress display; errors come back in the records
     settings.use(settings_path)
     _SLOT = _claim_slot(mapper)
@@ -108,11 +109,7 @@ def archive_path(mapper: str) -> Path:
 
 
 def read_archive(mapper: str) -> list[dict]:
-    path = archive_path(mapper)
-    if not path.exists():
-        return []
-    with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+    return progress.read_jsonl(archive_path(mapper))
 
 
 def code_versions() -> dict[str, str]:
@@ -173,12 +170,13 @@ class Runner:
                                         initargs=(mapper, str(settings.current().path)))
         self.archive = Archive(mapper)
         self._checked: set[str] = set()
+        self._inflight, self._inflight_lock = 0, threading.Lock()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, *exc):
+        self.close(force=exc_type is not None)
 
     def check(self, site_list: list[str]) -> None:
         """Stop unless these sites' preprocessing was built with the current settings (checked once per site)."""
@@ -190,8 +188,16 @@ class Runner:
     def submit(self, site: str, p: dict, stages: int | None = None, keep: Path | None = None):
         """A future of one site's record. p is completed with the settings file's defaults."""
         self.check([site])
-        return self.pool.submit(run_site, (site, params.complete(p, self.mapper), self.mapper, stages,
-                                           str(keep) if keep else None))
+        fut = self.pool.submit(run_site, (site, params.complete(p, self.mapper), self.mapper, stages,
+                                          str(keep) if keep else None))
+        with self._inflight_lock:
+            self._inflight += 1
+        fut.add_done_callback(self._finished)
+        return fut
+
+    def _finished(self, fut) -> None:
+        with self._inflight_lock:
+            self._inflight -= 1
 
     def evaluate(self, p: dict, site_list: list[str] | None = None, stages: int | None = None, method: str = "run",
                  tag: str = "", keep: Path | None = None, progress=None, archive: bool = True) -> dict[str, dict]:
@@ -223,5 +229,12 @@ class Runner:
             raise RuntimeError(f"every site failed: {errors}")
         return out
 
-    def close(self):
-        self.pool.shutdown(cancel_futures=True)
+    def close(self, force: bool = False):
+        """Shut the pool down. force (Ctrl-C or an error): stop the workers now if they are still running something,
+        abandoning those runs."""
+        if force and self._inflight:
+            try:
+                self.pool.terminate_workers()
+            except Exception:
+                pass
+        self.pool.shutdown(wait=True, cancel_futures=True)

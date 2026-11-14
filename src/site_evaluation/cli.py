@@ -5,7 +5,7 @@ site-eval: run, score and calibrate flood maps on the FIM benchmark sites, and l
     site-eval run      --mapper fldpln [--params SET] [--sites ...] [--keep]     run and score a parameter set
     site-eval optimize optuna --mapper fldpln --name NAME     calibrate (also sobol, cma, coord, profile, switches,
                                                               persite)
-    site-eval show     runs | run TAG | sites | site NAME | studies | top | importance | plausible | persite RUN |
+    site-eval show     runs | run TAG | sites | site NAME | studies | top | importance | best | persite RUN |
                        params [SET] | space | settings
     site-eval plot     run TAG | compare TAG TAG | stages TAG | convergence | landscape | persite RUN | sites |
                        site NAME | sensitivity [NAME]
@@ -68,15 +68,20 @@ def cmd_run(a):
     keep = config.results_path("maps", a.mapper, tag) if a.keep else None
     print(f"{a.mapper}, {len(site_list)} sites, stages {a.stages}, tag {tag}: {params.describe(p, a.mapper)}",
           flush=True)
+    from .progress import Progress
     t0 = time.time()
+    with Runner(a.mapper, min(a.workers, len(site_list))) as runner, Progress(len(site_list), tag, "site") as bar:
+        def done(site, rec):
+            if not a.quiet or not rec["ok"]:
+                err = "" if rec["ok"] else "  " + rec.get("error", "")[:150]
+                bar.write(f"  {site:<70} {_fmt(scoring.site_score(rec), a.digits)}  {rec['seconds']:6.1f}s{err}")
+            bar.update()
 
-    def progress(site, rec):
-        if not a.quiet:
-            err = "" if rec["ok"] else "  " + rec.get("error", "")[:150]
-            print(f"  {site:<70} {_fmt(scoring.site_score(rec), a.digits)}  {rec['seconds']:6.1f}s{err}", flush=True)
-
-    with Runner(a.mapper, min(a.workers, len(site_list))) as runner:
-        recs = runner.evaluate(p, site_list, stages, method="run", tag=tag, keep=keep, progress=progress)
+        try:
+            recs = runner.evaluate(p, site_list, stages, method="run", tag=tag, keep=keep, progress=done)
+        except KeyboardInterrupt:
+            bar.write(f"Stopped: {bar.n} of {len(site_list)} sites are scored and archived under tag {tag}.")
+            raise
     out = scoring.objective(recs)
     print(f"calib {_fmt(out['value'], a.digits)}  hold-out {_fmt(out['holdout'], a.digits)}  "
           f"all {_fmt(out['all'], a.digits)}  ({out['n_sites']} sites, {len(out['failed'])} failed, "
@@ -194,22 +199,22 @@ def cmd_show(a):
         _print_table(results.convergence(df) if not df.empty else None, a.digits)
     elif w == "top":
         df = results.optimization_frame(a.mapper)
-        if a.plausible:
-            df = df[df["plausible"]]
+        if a.in_range:
+            df = df[df["in_range"]]
         d = df.sort_values("value", ascending=False).head(a.k)
         for _, r in d.iterrows():
             print(f"{r['method']:<28} calib {_fmt(r['value'], a.digits)} hold {_fmt(r['holdout'], a.digits)} "
-                  f"{'plausible' if r['plausible'] else 'implausible n'} | {params.describe(r['params'], a.mapper)}")
+                  f"{'in range' if r['in_range'] else 'out of range'} | {params.describe(r['params'], a.mapper)}")
     elif w == "importance":
         imp, r2 = results.importance(results.optimization_frame(a.mapper), a.mapper)
         print(f"surrogate (extra trees), in-sample R² {r2:.2f}; permutation importance:")
         for n, v in imp.items():
             print(f"  {n:<18} {v:.4f}")
-    elif w == "plausible":
+    elif w == "best":
         df = results.optimization_frame(a.mapper)
-        b, gap = results.best_plausible(df)
+        b, gap = results.best_in_range(df)
         p = params.searched(b["params"], a.mapper)
-        print(f"best plausible: calib {_fmt(b['value'], a.digits)} hold {_fmt(b['holdout'], a.digits)} "
+        print(f"best in range: calib {_fmt(b['value'], a.digits)} hold {_fmt(b['holdout'], a.digits)} "
               f"({b['method']} {b.get('tag', '')}); best overall {_fmt(df['value'].max(), a.digits)}, "
               f"gap {gap:.4f}")
         print(json.dumps(p))
@@ -230,7 +235,7 @@ def cmd_show(a):
         site = sites.select_sites([a.site])[0] if a.site else sites.all_sites()[0]
         neo, arc, c2f, lib = params.model_args(p, a.mapper, site)
         S = settings.current()
-        print(json.dumps({"parameters": p, "plausible n": params.is_plausible(p),
+        print(json.dumps({"parameters": p, "outside the ranges": S.out_of_range(p),
                           f"arc_args (at {site}, cell {S.cell_size_m(site):.1f} m)": arc, "curve2flood_args": c2f,
                           "fldpln_library_args": lib, "nencarta": neo}, indent=1, default=str))
     elif w in ("space", "settings"):
@@ -251,9 +256,9 @@ def cmd_show(a):
 
 def cmd_sensitivity(a):
     from . import sensitivity, sites
-    sensitivity.run(a.mapper, a.name, a.trajectories, a.seed, a.threshold, a.stage, a.candidates, a.plausible,
-                    a.identify, a.reference, a.step, a.gamma, a.prefer,
-                    sites.select_sites(a.sites) if a.sites else None, a.workers, a.jobs, a.dry_run, a.digits)
+    sensitivity.run(a.mapper, a.name, a.trajectories, a.seed, a.threshold, a.stage, a.candidates, a.identify, a.reference, a.step, a.gamma, a.prefer,
+                    sites.select_sites(a.sites) if a.sites else None, a.workers, a.jobs, a.dry_run, a.digits,
+                    a.max_trajectories)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -350,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=30)
     p.add_argument("--tag", help="name of the run (default run_<date>_<time>)")
     p.add_argument("--keep", action="store_true", help="keep the flood maps (results/maps/<mapper>/<tag>)")
-    p.add_argument("--quiet", action="store_true", help="only the summary")
+    p.add_argument("--quiet", action="store_true", help="only failed sites and the summary")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("attributes", help="ARC's reach attributes of every site (runs each once)")
@@ -419,18 +424,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("sensitivity", help="which parameters matter (Morris screening) and which can be calibrated "
                                            "together (collinearity index); resumes by name",
-                       description="Screens every candidate parameter of the settings file (an optimize field, not "
-                                   "screen: false) with Morris elementary effects on the mean MCC of the calibration "
-                                   "sites, then tests the influential numbers for collinearity (Brun et al. 2001) at "
+                       description="Screens every candidate parameter of the settings file (a range, choices or a "
+                                   "switch, and not screen: false) with Morris elementary effects on the mean MCC of the "
+                                   "calibration sites and on each site's MCC (a parameter that moves sites both ways "
+                                   "isn't called negligible), then tests the influential numbers for collinearity (Brun et al. 2001) at "
                                    "the defaults. See the sensitivity module's documentation for the method.")
     common(p)
     p.add_argument("--name", help="study name (default: the DEM's name); the same name resumes or extends it")
-    p.add_argument("--trajectories", "-r", type=int, default=20, help="Morris trajectories (default 20)")
+    p.add_argument("--trajectories", "-r", type=int, default=20, help="Morris trajectories of every parameter "
+                                                                     "(default 20); also the size of a round")
+    p.add_argument("--max-trajectories", type=int, default=60,
+                   help="then rounds of more trajectories for the undecided parameters only, until they are decided "
+                        "or moved by this many (default 60; 0: no rounds)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--threshold", type=float, default=0.01, help="MCC change that counts (default 0.01)")
     p.add_argument("--stage", choices=["both", "screen", "identify"], default="both")
     p.add_argument("--candidates", nargs="*", help="screen only these (they may include screen: false ones)")
-    p.add_argument("--plausible", action="store_true", help="screen n over its plausible band, not its range")
     p.add_argument("--identify", nargs="*", help="the numbers to test for collinearity (default: the influential and "
                                                  "undecided ones)")
     p.add_argument("--reference", help="the set the collinearity is tested at (default: the settings file's defaults)")
@@ -444,9 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="list the candidates and the number of runs")
     p.set_defaults(func=cmd_sensitivity)
 
-    p = sub.add_parser("show", help="tables: runs, run TAG, sites, site NAME, studies, top, importance, plausible, "
+    p = sub.add_parser("show", help="tables: runs, run TAG, sites, site NAME, studies, top, importance, best, "
                                     "persite [RUN], params [SET], space, settings")
-    p.add_argument("what", choices=["runs", "run", "sites", "site", "studies", "top", "importance", "plausible",
+    p.add_argument("what", choices=["runs", "run", "sites", "site", "studies", "top", "importance", "best",
                                     "persite", "params", "space", "settings"])
     p.add_argument("target", nargs="?", help="the run tag, site, per-site run or parameter set")
     common(p, mapper_required=False)
@@ -454,9 +463,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--last", type=int, default=30, help="runs / site: how many to list")
     p.add_argument("--sort", default="score", choices=["score", "site", "bias", "seconds"])
     p.add_argument("--k", type=int, default=10)
-    p.add_argument("--plausible", action="store_true", help="top: only sets with plausible n")
+    p.add_argument("--in-range", action="store_true", help="top: only sets inside the settings file's ranges")
     p.add_argument("--refresh", action="store_true", help="sites: recompute the site table")
-    p.add_argument("--save", help="plausible: write the set to this JSON file")
+    p.add_argument("--save", help="best: write the set to this JSON file")
     p.add_argument("--site", help="params: the site whose cell size converts the metre stand-ins")
     p.add_argument("--section", nargs="*", help="settings: only these sections (arc, curve2flood, ...)")
     p.set_defaults(func=cmd_show)
@@ -490,7 +499,16 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"show {a.what} needs a run tag or site name")
     if a.command == "plot" and a.what in ("run", "compare", "stages", "persite", "site") and a.target is None:
         raise SystemExit(f"plot {a.what} needs a run tag, per-site run or site name")
-    a.func(a)
+    import signal
+    signal.signal(signal.SIGINT, signal.default_int_handler)    # also when started in the background with it ignored
+    # Workers stopped mid-run (a second Ctrl-C) leave locks that multiprocessing's resource tracker then cleans up;
+    # its warning about them is noise. It passes this filter on to the tracker process.
+    sys.warnoptions.append("ignore::UserWarning:multiprocessing.resource_tracker")
+    try:
+        a.func(a)
+    except KeyboardInterrupt:
+        print("stopped (Ctrl-C)", file=sys.stderr)
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

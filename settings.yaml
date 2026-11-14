@@ -14,13 +14,24 @@
 #              optimize: {fldpln: true, kernel: false}
 #   range      [low, high] for a number it is searched over. Add log: true to search on a log scale, and
 #              type: int for whole numbers (also inferred from an integer value).
+#   step       With a range: only whole multiples of the step are searched (the range shrinks to the multiples inside
+#              it; on a log scale it starts at one step). cell: the DEM's cell size from dem.nominal_cell_size_m, so
+#              the steps and the range's low end follow the DEM. On a log scale the steps are spread log-uniformly
+#              (optuna, which can't step on a log scale, searches their count: <name>_steps in its database).
 #   choices    The values a text or switch argument can take (a switch searches [false, true]).
-#   when       The switch it depends on. It is searched, and passed to its tool, only while that switch is on.
+#   when       What it depends on: it is searched, and passed to its tool, only while that holds. A name: that switch
+#              is on. {Name: value} or {Name: [values]}: that setting has that value (or one of them); several names
+#              must all hold. Any setting in the file can be named, nencarta's too:
+#                  when: Valley_Sections                 when: {solver: iterative}
+#                  when: {Stream_Slope_Method: [reach_average, local_average_corrected]}
+#              dem.name names the DEM:  when: {solver: iterative, dem.name: usgs}   (that DEM only)
+#              A setting at null leaves the choice to its tool, so the argument is passed; the optimizers and the
+#              screening count it as unused, unless null is listed.
 #   mapper     fldpln or kernel: it is used with that mapper only (multipoint: curve2flood's multi-point mapper, which
 #              site-eval doesn't run).
-#   plausible  [low, high], the physically plausible band (Manning's n), for `site-eval show top --plausible`.
 #   screen     false: `site-eval sensitivity` leaves it out (fixed beforehand, for example on physical grounds; say why
-#              in a comment). Every other argument with an optimize field is screened over its range.
+#              in a comment). Everything else outside nencarta's section with a range or choices, and every switch
+#              (true/false with an optimize field), is screened over its range.
 #   from       (ARC lines) Set by a stand-in in `derived`. To set or search such an argument directly, replace `from`
 #              with a value (and a range), and set the stand-in's optimize to false.
 #
@@ -42,8 +53,9 @@ dem:
   # aster, aw3d30, copdem, fabdem, gedtm, nasadem, srtm or usgs (3DEP lidar).
   name: fabdem
   # How the *_m stand-ins become cells. nominal: the DEM's cell size from the table below. measured: each site's own
-  # (the geometric mean of a cell's width and height in metres; 23-31 m for a 1" DEM, depending on latitude).
-  cell_size: nominal
+  # (the geometric mean of a cell's width and height in metres; 25.9-30.0 m for FABDEM at these 85 sites).
+  cell_size: measured
+  # Also the search step of `step: cell`, with either cell_size.
   nominal_cell_size_m: {aster: 30, aw3d30: 30, copdem: 30, fabdem: 30, gedtm: 30, nasadem: 30, srtm: 30, usgs: 10}
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -51,17 +63,17 @@ dem:
 # ---------------------------------------------------------------------------------------------------------------------
 mannings_n:
   n_tree:     {class: 10, label: Tree Cover, value: {fldpln: 0.1414213562373095, kernel: 0.1}, optimize: true, range: [0.065, 0.4], log: true}
-  n_shrub:    {class: 20, label: Shrubland, value: 0.05, optimize: false, range: [0.035, 0.4], log: true}
+  n_shrub:    {class: 20, label: Shrubland, value: 0.05, optimize: false, range: [0.035, 0.4], log: true, screen: false}   # nearly absent: 14 benchmark-flooded cells at 2 of the 85 sites
   n_grass:    {class: 30, label: Grassland, value: {fldpln: 0.0565685424949238, kernel: 0.04}, optimize: true, range: [0.025, 0.4], log: true}
   n_crop:     {class: 40, label: Cropland, value: {fldpln: 0.0565685424949238, kernel: 0.04}, optimize: true, range: [0.02, 0.5], log: true}
   n_urban:    {class: 50, label: Builtup, value: {fldpln: 0.02697318745954566, kernel: 0.04415880433163923}, optimize: true, range: [0.01, 0.5], log: true}
   n_bare:     {class: 60, label: Bare, value: 0.03, optimize: false, range: [0.01, 0.13], log: true}
-  n_snow:     {class: 70, label: SnowIce, value: 0.03, optimize: false, range: [0.01, 0.03], log: true}
+  n_snow:     {class: 70, label: SnowIce, value: 0.03, optimize: false, range: [0.01, 0.03], log: true, screen: false}   # absent: no cell at any of the 85 sites
   # The channel: ARC gives the stream cells and the channel between its banks the water class's n.
-  n_water:    {class: 80, label: Water, value: {fldpln: 0.05117773119963173, kernel: 0.03741657386773942}, optimize: true, range: [0.01, 0.05], log: true}
-  n_wetland:  {class: 90, label: Emergent_Herb_Wet, value: 0.1, optimize: false, range: [0.05, 0.15], log: true}
-  n_mangrove: {class: 95, label: Mangroves, value: 0.1, optimize: false, range: [0.08, 0.2], log: true}
-  n_moss:     {class: 100, label: MossLichen, value: 0.1, optimize: false, range: [0.025, 0.05], log: true}
+  n_water:    {class: 80, label: Water, value: {fldpln: 0.05117773119963173, kernel: 0.03741657386773942}, optimize: true, range: [0.01, 0.075], log: true}
+  n_wetland:  {class: 90, label: Emergent_Herb_Wet, value: 0.1, optimize: false, range: [0.05, 0.15], log: true, screen: false}   # nearly absent: 0.14% of the benchmark flood area (2.4% at most at a site)
+  n_mangrove: {class: 95, label: Mangroves, value: 0.1, optimize: false, range: [0.08, 0.2], log: true, screen: false}   # absent: no cell at any of the 85 sites
+  n_moss:     {class: 100, label: MossLichen, value: 0.035, optimize: false, range: [0.025, 0.05], log: true, screen: false}   # absent: no cell at any of the 85 sites
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Stand-ins: searched in place of the ARC arguments they set (the ARC lines marked `from`)
@@ -85,13 +97,19 @@ derived:
   # (depth m = coefficient × area_km2 ^ exponent; nencarta's former law), which set the bathymetry's depth instead of
   # the bankfull flow. Off: both left out.
   power_depth:            {value: false, optimize: true}
-  depth_law_coefficient:  {value: 0.27, optimize: false, range: [0.05, 2.0], log: true, when: power_depth}
-  depth_law_exponent:     {value: 0.21, optimize: false, range: [0.1, 0.6], when: power_depth}
+  depth_law_coefficient:  {value: 0.27, optimize: false, log: true, when: power_depth}
+  depth_law_exponent:     {value: 0.21, optimize: false, when: power_depth}
 
-  # ARC's slope and direction windows, in metres along the stream rather than cells, so a value means the same on
-  # every DEM: Gen_Slope_Dist and Gen_Dir_Dist = round(metres / cell size), at least 1 (cell size: see `dem`).
-  Gen_Slope_Dist_m: {value: {fldpln: 90.0, kernel: 30.0}, optimize: true, range: [30.0, 1200.0], log: true}
-  Gen_Dir_Dist_m:   {value: {fldpln: 60.0, kernel: 960.0}, optimize: true, range: [30.0, 1200.0], log: true}
+  # ARC's slope and direction windows, in metres rather than cells, so a value means the same on every DEM:
+  # Gen_Slope_Dist and Gen_Dir_Dist = round(metres / cell size), at least 1 (cell size: see `dem`). Each is a distance
+  # EACH WAY: ARC uses the stream cells within that many cells of the cell along each axis, a square 2d + 1 cells
+  # wide. The direction uses the reach's own cells; the local slope average also takes the main-stem reaches above
+  # and below. Searched in whole cells of the DEM from one cell up (step: cell): 30-1200 m, 1-40 cells, on FABDEM.
+  # 1200 m is half the median reach. Reach lengths at these sites (2026-11-12, 2401 reaches): median 2.5 km,
+  # quartiles 1.3-4.3 km, 2.5th percentile 0.2 km.
+  # Gen_Slope_Dist is used by every Stream_Slope_Method but end_points, which takes each reach's end points.
+  Gen_Slope_Dist_m: {value: {fldpln: 90.0, kernel: 30.0}, optimize: true, range: [10.0, 1200.0], log: true, step: cell, when: {Stream_Slope_Method: [local_average, local_average_corrected, reach_average, local_fit]}}
+  Gen_Dir_Dist_m:   {value: {fldpln: 60.0, kernel: 60.0}, optimize: true, range: [10.0, 1200.0], log: true, step: cell}
 
 # ---------------------------------------------------------------------------------------------------------------------
 # nencarta. These shape the cached preprocessing, so they can't be optimized: change one, then `site-eval prepare`.
@@ -126,7 +144,7 @@ nencarta:
   lakes: {value: "~/data/all_lakes_filtered_trimmed_tiled.parquet"}   # lakes: kept out of burned channels, cut the moved network
   ocean: {value: null}                            # ocean polygons: streams end where they reach the sea
   move_stream_network_to_thalweg: {value: true}   # move each reach onto the DEM's flow path (FLDPLN needs it)
-  new_strm_threshold_km2: {value: 1}              # smallest drainage area (km2) of the flow paths reaches move onto
+  new_strm_threshold_km2: {value: 0.25}              # smallest drainage area (km2) of the flow paths reaches move onto
   burn_streams: {value: true}                     # burn the streams into the DEM before mapping
   relocate_misplaced_streams: {value: true}       # first move reaches the DEM shows are off their river
   use_dem_derived_channel_mask: {value: true}     # find the channel the DEM shows; smooth its flattened water; add it to the water mask
@@ -190,7 +208,7 @@ nencarta:
   file_names: {value: null}                       # new names for kinds of output files
   use_parquet: {value: true}                      # the FLDPLN stream info table as Parquet
   use_yaml: {value: true}                         # ARC and curve2flood input files as YAML
-  compression: {value: "LZW"}                     # compression of the rasters nencarta writes
+  compression: {value: "None"}                     # compression of the rasters nencarta writes
 
   # --- Running ---
   overwrite: {value: false}                       # remake intermediate files that exist
@@ -214,14 +232,14 @@ arc:
   Degree_Interval: {from: rotate}                 # step between those angles (degrees)
   # Points either side of the stream cell to look for lower ground (0: off). nencarta's default is 2; the streams are
   # moved onto the DEM's flow paths, so 0.
-  Low_Spot_Range: {value: 0, optimize: false, range: [0, 5]}
+  Low_Spot_Range: {value: 0, optimize: false, range: [0, 5], screen: false}
   # Kept fixed (Ricky).
-  Stream_Slope_Method: {value: "local_average_corrected", optimize: false, screen: false, choices: ["local_average", "local_average_corrected", "reach_average", "end_points", "local_fit"]}
+  Stream_Slope_Method: {value: "local_average_corrected", optimize: false, choices: ["local_average", "local_average_corrected", "reach_average", "end_points", "local_fit"]}
   # The percentiles of a reach's slopes reach_average and local_average_corrected work between (ARC's 5/95; nencarta's 25/75).
-  Slope_Low_Percentile: {value: 5, optimize: false, range: [0, 50]}
-  Slope_High_Percentile: {value: 95, optimize: false, range: [50, 100]}
+  Slope_Low_Percentile: {value: 5, screen: false, when: {Stream_Slope_Method: [reach_average, local_average_corrected]}} # These just filter outliers, should not need calibration
+  Slope_High_Percentile: {value: 95, screen: false, when: {Stream_Slope_Method: [reach_average, local_average_corrected]}} # These just filter outliers, should not need calibration
   # Overbanks from lines square to the valley, at the valley's slope (kept fixed, Ricky).
-  Valley_Sections: {value: true, optimize: false, screen: false}
+  Valley_Sections: {value: true, optimize: false}
   Valley_Dir_Widths: {value: 16.0, optimize: false, range: [4.0, 40.0], when: Valley_Sections}   # channel widths each way for the valley's direction
   Valley_Dir_Dist: {value: 40, optimize: false, range: [2, 120], when: Valley_Sections}           # cells each way, where a reach has no width
   Subcell_Channels: {value: {fldpln: false, kernel: true}, optimize: true}   # rebuild channels under 10 cells across below the cell scale
@@ -236,7 +254,7 @@ arc:
   deep_factor: {from: dvn}
   # Multiplies every conveyance (Q = K √S f): exactly the same maps as dividing every n by it (checked 2026-11-12,
   # max |dMCC| 0.0 at six sites), so it duplicates a common multiplier on the n values.
-  slope_adjustment_factor: {value: 1.0, optimize: false, screen: false, range: [0.5, 2.0], log: true}
+  slope_adjustment_factor: {value: 1.0, optimize: false, range: [0.5, 2.0], log: true, screen: false} # This is just a knob on manning's n, should not need calibration
   # Water surfaces by the standard-step method along the network, not each section's normal depth (kept fixed, Ricky).
   Standard_Step: {value: true, optimize: false, screen: false}
   Standard_Step_Eddy_Length: {value: 300.0, optimize: false, range: [0.0, 1000.0], when: Standard_Step}   # metres downstream for the eddy loss
@@ -244,26 +262,32 @@ arc:
   # --- Bathymetry ---
   # true: the banks are the bank tops and the bankfull flow fills the channel to them; false: the DEM's water surface
   # carries the baseflow. Sets nencarta's specified_bathyflow_field (bankfull or baseflow). true (Ricky).
-  Bathy_Use_Banks: {value: true, optimize: false, screen: false}
+  Bathy_Use_Banks: {value: true, optimize: false}
   Bathy_Trap_H: {value: {fldpln: 0.0, kernel: 0.43875476549804865}, optimize: true, range: [0.0, 0.5]}   # trapezoid side share of the top width
   Bathy_Smooth_Banks: {value: true, optimize: false}     # smooth each reach's channel widths and bank elevations
   Bathy_Smooth_Bed: {value: null, choices: [true, false]}   # null: ARC decides (off with Standard_Step or Bathy_Use_Banks)
-  Bathy_Bed_Cap: {value: false, optimize: false}         # hold the bed to ±0.5 m per m (does nothing with the standard step and banks)
-  Bathy_Bankless_Max_Baseflow: {value: 20.0, optimize: false, range: [0.0, 100.0]}   # m3/s; ARC's default (Ricky, 2026-10-28)
-  FindBanksBasedOnLandCover: {value: false, optimize: false}   # nencarta always gives ARC the water mask
+  # Hold the bed to ±0.5 m per m. ARC applies it only while it smooths the bed (arc/pipeline.py), so it depends on
+  # Bathy_Smooth_Bed, not on Standard_Step or Bathy_Use_Banks directly. ARC's own default is true.
+  Bathy_Bed_Cap: {value: false, optimize: false, when: Bathy_Smooth_Bed}
+  # With Bathy_Use_Banks only: a cross section without banks of its own and with less baseflow (m3/s) than this carries
+  # it at its stream cell's level. ARC's default (Ricky, 2026-10-28).
+  Bathy_Bankless_Max_Baseflow: {value: 20.0, optimize: false, range: [0.0, 100.0], when: Bathy_Use_Banks, screen: false} # none of our sites hit this
+  # Banks from the land cover's water, used only without a water mask: nencarta gives ARC one whenever it makes the
+  # bathymetry.
+  FindBanksBasedOnLandCover: {value: false, optimize: false, when: {disable_bathymetry: true}}
   coefficient_depth: {from: power_depth}
   exponent_depth: {from: power_depth}
   # The channel width's drainage-area power law (width m = coefficient × area_km2 ^ exponent): nencarta's, for the
   # channels whose banks no mask or DEM shows.
-  coefficient_width: {value: 2.44, optimize: false, range: [0.5, 10.0], log: true}
-  exponent_width: {value: 0.34, optimize: false, range: [0.2, 0.6]}
+  coefficient_width: {value: 2.44, optimize: false, log: true}
+  exponent_width: {value: 0.34, optimize: false}
 
   # --- Rating curves and outputs ---
-  VDT_Database_NumIterations: {value: 30, optimize: false, range: [10, 60]}   # flows per rating curve
+  VDT_Database_NumIterations: {value: 15, optimize: false}   # flows per rating curve
   Reach_Average_Curve_File: {value: false}
   Print_Decision_Log: {value: null}               # a table of what each step decided for each stream cell
   Log_File: {value: null}
-  Compression: {value: null}                      # ARC's raster compression (default ZSTD)
+  Compression: {value: None}                      # ARC's raster compression (default ZSTD)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # curve2flood (curve2flood_args). nencarta sets: DEM_File, Print_VDT_Database, Print_Curve_File, COMID_Flow_File,
@@ -272,7 +296,7 @@ arc:
 # ---------------------------------------------------------------------------------------------------------------------
 curve2flood:
   Make_Output_GPKG: {value: false}                # also write the flood extent as polygons
-  compression: {value: null}                      # the maps' compression (default LZW)
+  compression: {value: None}                      # the maps' compression (default LZW)
   # Always flood the stream cells and the land cover's water cells (on since 2026-11-11: +0.004 FLDPLN, +0.002 kernel).
   Flood_WaterLC_and_STRM_Cells: {value: true, optimize: false}
   Flood_Bathy_Mask: {value: true, optimize: false}    # always flood the water mask's cells
@@ -280,7 +304,7 @@ curve2flood:
   # --- Kernel-weighted mapper ---
   TW_MultFact: {value: 3.914795792533067, optimize: true, range: [0.1, 10.0], log: true, mapper: kernel}   # multiplies every top width
   TopWidthPlausibleLimit: {value: 6166.742575746264, optimize: true, range: [300.0, 10000.0], log: true, mapper: kernel}   # widest top width (m)
-  LocalFloodOption: {value: false, optimize: false, mapper: kernel}   # a stream cell's water reaches only cells connected to it
+  LocalFloodOption: {value: false, optimize: false, mapper: kernel, screen: false}   # a stream cell's water reaches only cells connected to it. This method does not matter and does not work right
 
   # --- FLDPLN mapper ---
   FLDPLN_Min_Flood_Depth: {value: 0.18399071593792604, optimize: true, range: [0.001, 1.0], log: true, mapper: fldpln}   # shallowest water (m) that floods a cell
@@ -323,17 +347,17 @@ fldpln_library:
   spill_decay: {value: {usgs: 0.003, other: 0.01}, optimize: false, range: [0.0, 0.1], mapper: fldpln}
   solver: {value: "iterative", optimize: false, choices: ["iterative", "exact"], mapper: fldpln}
   # Iterative solver: the least depth (m) a flooded pixel counts as when deciding where a spill stops.
-  fldmn: {value: 0.2715658348459931, optimize: true, range: [0.01, 1.0], log: true, mapper: fldpln}
-  dh: {value: 0.5, optimize: false, range: [0.1, 1.0], mapper: fldpln}            # depth step of the iterative solver (m)
-  fldmx: {value: 25.0, optimize: false, range: [5.0, 50.0], mapper: fldpln}        # largest depth to flood to (m)
-  iterative_spill: {value: false, optimize: false, mapper: fldpln}                 # keep spilling until the floodplain stops growing
+  fldmn: {value: 0.2715658348459931, optimize: true, range: [0.01, 1.0], log: true, mapper: fldpln, when: {solver: iterative}}
+  dh: {value: 0.5, optimize: false, range: [0.1, 1.0], mapper: fldpln, when: {solver: iterative}}   # depth step of the iterative solver (m)
+  fldmx: {value: 25.0, optimize: false, mapper: fldpln, screen: false}        # largest depth to flood to (m). This is just a limit, we do not need to move it
+  iterative_spill: {value: false, optimize: false, mapper: fldpln, when: {solver: iterative, dem.name: usgs}}   # keep spilling until the floodplain stops growing
   max_reach_length: {value: 5000.0, optimize: false, range: [500.0, 20000.0], log: true, mapper: fldpln}   # longest segment (m)
   max_profile_deviation: {value: 1.0, optimize: false, range: [0.1, 5.0], log: true, mapper: fldpln}       # cut reaches where the bed bends more than this (m)
-  max_cells_per_segment: {value: null, mapper: fldpln}   # most rows a segment may contribute (exact solver)
-  global_max_wse: {value: 0.0, mapper: fldpln}           # highest water surface allowed (0: no limit)
+  max_cells_per_segment: {value: null, mapper: fldpln, when: {solver: exact}, screen: false}   # most rows a segment may contribute. For exact solver, to avoid memory, not a thing to calibrate
+  global_max_wse: {value: 0.0, mapper: fldpln}           # highest water surface allowed (0: no limit).
   bg: {value: -9999, mapper: fldpln}                     # no-data value of the filled DEM
   parallel: {value: false, mapper: fldpln}               # solve several segments at once
-  processes: {value: null, mapper: fldpln}
+  processes: {value: null, mapper: fldpln, when: fldpln_library.parallel}   # threads (default: CPUs, at most 4)
   stream_ids: {value: null, mapper: fldpln}              # only build these segments
 
 # ---------------------------------------------------------------------------------------------------------------------

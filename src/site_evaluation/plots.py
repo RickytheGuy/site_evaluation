@@ -157,11 +157,9 @@ def convergence(df: pd.DataFrame, mapper: str, out=None) -> Path:
 
 def landscape(df: pd.DataFrame, mapper: str, out=None) -> Path:
     """Every global evaluation's calibration value against each parameter, one panel per parameter. The best set
-    is marked; plausible sets (n inside the bands) are blue, the rest grey."""
+    is marked; sets inside the settings file's ranges are blue, the rest (from studies with wider ranges) grey."""
     plt = _plt()
-    from . import settings
     sp = params.space(mapper)
-    bands = settings.current().plausible()
     names = list(sp)
     ncol = 4
     nrow = int(np.ceil(len(names) / ncol))
@@ -169,7 +167,7 @@ def landscape(df: pd.DataFrame, mapper: str, out=None) -> Path:
     P = pd.DataFrame([params.complete(p, mapper) for p in df["params"]])
     lo = np.nanpercentile(df["value"], 5)
     b = int(np.argmax(df["value"].to_numpy()))
-    plaus = df["plausible"].to_numpy()
+    inside = df["in_range"].to_numpy()
     for ax, n in zip(axes.flat, names):
         spec = sp[n]
         if spec.kind == "choice":
@@ -189,18 +187,16 @@ def landscape(df: pd.DataFrame, mapper: str, out=None) -> Path:
         if spec.kind in ("float", "int"):           # the whole searched range, however few the points
             pad = (spec.high / spec.low) ** 0.03 if spec.log else 0.03 * (spec.high - spec.low)
             ax.set_xlim(*((spec.low / pad, spec.high * pad) if spec.log else (spec.low - pad, spec.high + pad)))
-        ax.scatter(x[~plaus], df["value"][~plaus], s=8, color=AXIS, lw=0)
-        ax.scatter(x[plaus], df["value"][plaus], s=8, color=SERIES[0], lw=0, alpha=0.6)
+        ax.scatter(x[~inside], df["value"][~inside], s=8, color=AXIS, lw=0)
+        ax.scatter(x[inside], df["value"][inside], s=8, color=SERIES[0], lw=0, alpha=0.6)
         ax.scatter([x[b]], [df["value"].iloc[b]], s=60, color=SERIES[1], edgecolor=SURFACE, lw=2, zorder=5)
-        if n in bands:
-            ax.axvspan(*bands[n], color=SERIES[0], alpha=0.06, lw=0)
         ax.set_title(n, fontsize=9)
         ax.set_ylim(lo, df["value"].max() + 0.005)
     for ax in list(axes.flat)[len(names):]:
         ax.set_visible(False)
     for ax in axes[:, 0]:
         ax.set_ylabel("calibration value")
-    fig.suptitle(f"{mapper}: {len(df)} evaluations; blue = plausible n, orange = best; shaded = plausible band",
+    fig.suptitle(f"{mapper}: {len(df)} evaluations; blue = inside the ranges, orange = best",
                  x=0.01, ha="left", fontsize=10, fontweight="bold")
     fig.tight_layout()
     return _save(fig, _out(f"landscape_{mapper}", out))
@@ -377,34 +373,41 @@ def site_maps(site: str, stages: list[str] | None = None, maps_dir: Path | None 
 # Sensitivity
 # --------------------------------------------------------------------------------------------------------------------
 
-CLASS_COLOR = {"influential": SERIES[0], "undecided": SERIES[1], "negligible": AXIS}
+CLASS_COLOR = {"influential": SERIES[0], "undecided": SERIES[1], "trades sites": SERIES[2],
+               "undecided (sites)": SERIES[1], "negligible": AXIS}
 
 
 def sensitivity_screening(table: pd.DataFrame, study, threshold: float = 0.01, out=None) -> Path:
-    """Morris screening: each parameter's μ* with its bootstrap 95% interval, coloured by class, and site μ* (the mean
-    of each site's own μ*) as a hollow ring; the dashed line is the threshold."""
+    """Morris screening: each parameter's μ* with its bootstrap 95% interval, coloured by class, and site μ* (a site's
+    mean |change|) as a hollow ring on its own interval (thin, just below); the dashed line is the threshold."""
     from matplotlib.lines import Line2D
     from . import sensitivity
     plt = _plt()
     t = table[table["class"] != "never active"].iloc[::-1].reset_index(drop=True)
-    fig, ax = plt.subplots(figsize=(8, max(4, 0.2 * len(t) + 1.2)))
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.25 * len(t) + 1.2)))
     y = np.arange(len(t))
     colors = [CLASS_COLOR[c] for c in t["class"]]
     ax.hlines(y, t["ci_low"], t["ci_high"], color=colors, lw=2)
     ax.scatter(t["mu_star"], y, s=36, color=colors, zorder=3, edgecolor=SURFACE, linewidth=1)
-    ax.scatter(t["site_mu_star"], y, s=30, facecolor="none", edgecolor=INK2, linewidth=1, zorder=2)
+    if "site_ci_low" in t:
+        ax.hlines(y - 0.3, t["site_ci_low"], t["site_ci_high"], color=INK2, lw=1)
+    ax.scatter(t["site_mu_star"], y - (0.3 if "site_ci_low" in t else 0), s=24, facecolor=SURFACE, edgecolor=INK2,
+               linewidth=1, zorder=2)
     ax.axvline(threshold, color=INK2, lw=1, ls="--")
     ax.set_yticks(y, [f"{p}" + (" ◆" if k.split()[0] not in ("float", "int") else "") for p, k in
                       zip(t["parameter"], t["kind"])], fontsize=7)
     ax.grid(axis="y", visible=False)
     ax.set_xlim(left=0)
     ax.set_xlabel("μ*: mean |change in the sites' mean MCC| when the parameter rises by 2/3 of its range")
-    r = sensitivity.complete_trajectories(study)
-    ax.set_title(f"{study.mapper} on {study.header['dem']}: Morris screening, {r} trajectories, "
+    r, rounds = sensitivity.complete_trajectories(study), len(study.rounds())
+    more = f" (+ {rounds} round{'s' * (rounds > 1)} for the undecided)" if rounds else ""
+    ax.set_title(f"{study.mapper} on {study.header['dem']}: Morris screening, {r} trajectories{more}, "
                  f"{len(study.sites)} sites")
-    handles = [Line2D([], [], color=CLASS_COLOR[c], marker="o", lw=2, label=c) for c in CLASS_COLOR
-               if c in set(t["class"])]
-    handles += [Line2D([], [], color=INK2, marker="o", markerfacecolor="none", lw=0, label="site μ*"),
+    present = set(t["class"]) | ({"undecided"} if "undecided (sites)" in set(t["class"]) else set())
+    handles = [Line2D([], [], color=CLASS_COLOR[c], marker="o", lw=2,
+                      label=c + (" (mean or sites)" if c == "undecided" and "undecided (sites)" in present else ""))
+               for c in CLASS_COLOR if c in present and c != "undecided (sites)"]
+    handles += [Line2D([], [], color=INK2, marker="o", markerfacecolor=SURFACE, lw=1, label="site μ* and interval"),
                 Line2D([], [], color=INK2, lw=1, ls="--", label=f"threshold {threshold:g}"),
                 Line2D([], [], color="none", marker="", label="◆ switch or choice")]
     ax.legend(handles=handles, loc="lower right")

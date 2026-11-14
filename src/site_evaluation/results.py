@@ -147,7 +147,7 @@ def optimization_frame(mapper: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["method", "order", "time", "value", "holdout", "all", "params", "site_scores",
                                      "tag"])
     df = pd.concat(frames, ignore_index=True)
-    df["plausible"] = [params.is_plausible(p) for p in df["params"]]
+    df["in_range"] = [params.in_range(p) for p in df["params"]]
     return df
 
 
@@ -173,7 +173,7 @@ def unit_matrix(df: pd.DataFrame, mapper: str) -> tuple[np.ndarray, list[str]]:
     for j, n in enumerate(names):
         spec = params.space(mapper)[n]
         if spec.when:
-            off = np.array([not params.switch_on(p, spec.when, mapper) for p in df["params"]])
+            off = np.array([not params.active(p, spec.when, mapper) for p in df["params"]])
             X[off, j] = 0.5
     return X, names
 
@@ -190,11 +190,11 @@ def importance(df: pd.DataFrame, mapper: str) -> tuple[pd.Series, float]:
     return pd.Series(pi.importances_mean, index=names).sort_values(ascending=False), model.score(X, y)
 
 
-def best_plausible(df: pd.DataFrame) -> tuple[pd.Series, float]:
-    """The best evaluation whose n lie in the plausible bands, and its gap to the best overall."""
-    ok = df[df["plausible"]]
+def best_in_range(df: pd.DataFrame) -> tuple[pd.Series, float]:
+    """The best evaluation whose values all lie in the settings file's ranges, and its gap to the best overall."""
+    ok = df[df["in_range"]]
     if ok.empty:
-        raise SystemExit("No evaluated set lies inside the plausible n bands")
+        raise SystemExit("No evaluated set lies inside the settings file's ranges")
     b = ok.loc[ok["value"].idxmax()]
     return b, float(df["value"].max() - b["value"])
 

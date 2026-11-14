@@ -28,8 +28,8 @@ SECTIONS = ("mannings_n", "derived", "nencarta", "arc", "curve2flood", "fldpln_l
 #: Where each tool-argument section goes in nencarta's configuration
 TOOL_SECTIONS = {"nencarta": None, "arc": "arc_args", "curve2flood": "curve2flood_args",
                  "fldpln_library": "fldpln_library_args"}
-ENTRY_FIELDS = {"value", "optimize", "range", "log", "type", "choices", "when", "mapper", "plausible", "from",
-                "class", "label", "screen"}
+ENTRY_FIELDS = {"value", "optimize", "range", "log", "type", "choices", "when", "mapper", "from", "class", "label",
+                "screen", "step"}
 PERSITE_FIELDS = {"scales", "range", "log", "type", "optimize", "mapper"}
 
 #: The stand-ins and the ARC arguments each sets (see derived_args)
@@ -49,6 +49,60 @@ class SettingsError(ValueError):
     pass
 
 
+# --------------------------------------------------------------------------------------------------------------------
+# `when`: what an argument depends on
+# --------------------------------------------------------------------------------------------------------------------
+
+#: A `when` may also name the DEM: {dem.name: usgs} holds only while the file's dem.name is usgs
+DEM_KEY = "dem.name"
+
+
+def normal_when(when) -> str | dict | None:
+    """A `when` as a Spec holds it: a switch's name as written, or {setting: [values]}."""
+    if not when or isinstance(when, str):
+        return when or None
+    return {k: list(v) if isinstance(v, (list, tuple)) else [v] for k, v in when.items()}
+
+
+def conditions(when) -> list[tuple[str, list]]:
+    """A `when` as (setting, the values it holds for) pairs, all of which must hold. A name alone: that switch on."""
+    if not when:
+        return []
+    if isinstance(when, str):
+        return [(when, [True])]
+    return [(k, list(v) if isinstance(v, (list, tuple)) else [v]) for k, v in when.items()]
+
+
+def holds(when, value_of) -> bool:
+    """Whether a `when` holds, value_of(name) giving each setting's value. A setting at null (the tool decides) meets
+    a condition only where null is listed."""
+    return all(any(_same(value_of(k), x) for x in vals) for k, vals in conditions(when))
+
+
+def _same(a, b) -> bool:
+    """Equal and of one kind: true is not 1."""
+    return a == b and isinstance(a, bool) == isinstance(b, bool)
+
+
+def describe_when(when) -> str:
+    """A `when` in a few words: "Valley_Sections on", "solver iterative"."""
+    return ", ".join(f"{k} on" if vals == [True] else f"{k} {'/'.join(map(str, vals))}"
+                     for k, vals in conditions(when))
+
+
+def dependence_order(whens: dict) -> list[str]:
+    """The names of whens ({name: its when}), each after the names among them its `when` depends on, otherwise in
+    their order."""
+    out, pending = [], list(whens)
+    while pending:
+        ready = [n for n in pending if all(c in out or c not in whens for c, _ in conditions(whens[n]))]
+        if not ready:
+            raise SettingsError(f"`when` goes round in a circle among {pending}")
+        out.append(ready[0])
+        pending.remove(ready[0])
+    return out
+
+
 @dataclass
 class Spec:
     """How one parameter is searched."""
@@ -57,7 +111,8 @@ class Spec:
     high: float | None = None
     log: bool = False
     choices: tuple = ()
-    when: str | None = None         # the switch it depends on
+    when: str | dict | None = None  # what it depends on: a switch's name, or {setting: [values]} (see conditions)
+    step: float | None = None       # searched on whole multiples of this (low and high are multiples)
 
     def as_tuple(self) -> tuple:
         """The old fim3 form: (kind, low, high, log[, when]) or ("bool",)."""
@@ -114,6 +169,8 @@ class Settings:
         return m is None or m == mapper
 
     def default(self, key: str, mapper: str):
+        if key == DEM_KEY:
+            return self.dem
         return self.resolve(self.entries[key].raw.get("value"), mapper)
 
     def optimized(self, e: Entry, mapper: str) -> bool:
@@ -121,7 +178,7 @@ class Settings:
 
     def spec(self, e: Entry, mapper: str) -> Spec:
         raw = e.raw
-        when = raw.get("when")
+        when = normal_when(raw.get("when"))
         value = self.resolve(raw.get("value"), mapper)
         if "choices" in raw:
             choices = tuple(raw["choices"])
@@ -133,29 +190,61 @@ class Settings:
         lo, hi = raw["range"]
         is_int = raw.get("type") == "int" or (raw.get("type") is None and isinstance(lo, int)
                                                and isinstance(hi, int) and (value is None or isinstance(value, int)))
-        return Spec("int" if is_int else "float", lo, hi, bool(raw.get("log", False)), when=when)
+        return numeric_spec("int" if is_int else "float", lo, hi, bool(raw.get("log", False)),
+                            self.step_size(raw, mapper), when)
+
+    def step_size(self, raw: dict, mapper: str) -> float | None:
+        """An argument's search step (None: none). `cell` is the DEM's cell size from dem.nominal_cell_size_m."""
+        step = self.resolve(raw.get("step"), mapper)
+        if step is None:
+            return None
+        if step == "cell":
+            if self.dem not in self.nominal_cell_size:
+                raise SettingsError(f"step: cell needs a cell size for {self.dem} in dem.nominal_cell_size_m")
+            return float(self.nominal_cell_size[self.dem])
+        if isinstance(step, bool) or not isinstance(step, (int, float)):
+            raise SettingsError(f"step must be cell or a number above 0, not {step!r}")
+        return float(step)
 
     def space(self, mapper: str) -> dict[str, Spec]:
-        """The searched parameters for a mapper, in file order. One that depends on a switch held off (not searched,
-        default off) is left out: it would never be used."""
-        out = {}
-        for k, e in self.entries.items():
-            if not self.optimized(e, mapper):
-                continue
-            when = e.raw.get("when")
-            if when and when not in out and not self.default(when, mapper):
-                continue
-            out[k] = self.spec(e, mapper)
+        """The searched parameters for a mapper, in file order. One whose `when` can't hold (it names a setting that
+        isn't searched and whose default the `when` doesn't list) is left out: it would never be used."""
+        out = {k: self.spec(e, mapper) for k, e in self.entries.items() if self.optimized(e, mapper)}
+        self._drop_unused(out, mapper)
         return out
 
-    def candidates(self, mapper: str, plausible: bool = False, only: list[str] | None = None
-                   ) -> tuple[dict[str, Spec], dict[str, str]]:
-        """The parameters `site-eval sensitivity` screens, and why each other argument with an optimize field isn't
-        screened. A candidate is any argument with an optimize field (true or false) that the mapper uses, outside
-        nencarta's section (it shapes the cache), not marked `screen: false`, with a range, choices or a switch's
-        true/false. One that depends on a switch which is neither a candidate nor on by default is left out (never
-        used). only: these names instead (they may include `screen: false` ones). plausible: search n over its
-        plausible band rather than its range."""
+    def _drop_unused(self, names: dict, mapper: str) -> dict[str, str]:
+        """Leave out of names (in place) each one whose `when` can't hold: it names a setting that isn't among names
+        and whose default it doesn't list. Repeated, as leaving one out can leave out those that depend on it.
+        Returns {name: why}."""
+        why = {}
+        while True:
+            gone = {}
+            for k in names:
+                for c, vals in conditions(self.entries[k].raw.get("when")):
+                    if c not in names and not holds({c: vals}, lambda n: self.default(n, mapper)):
+                        gone[k] = f"needs {describe_when({c: vals})}"
+                        break
+            if not gone:
+                return why
+            for k in gone:
+                del names[k]
+            why.update(gone)
+
+    def screenable(self, e: Entry, mapper: str) -> bool:
+        """Whether an argument can be screened: outside nencarta's section (it shapes the cache), not set by a
+        stand-in, and with a range, choices, or a true/false value and an optimize field (a switch)."""
+        r = e.raw
+        if e.is_from or e.section == "nencarta":
+            return False
+        return ("range" in r or "choices" in r
+                or ("optimize" in r and isinstance(self.default(e.key, mapper), bool)))
+
+    def candidates(self, mapper: str, only: list[str] | None = None) -> tuple[dict[str, Spec], dict[str, str]]:
+        """The parameters `site-eval sensitivity` screens, and why each other screenable argument isn't. A candidate
+        is any screenable argument (see screenable) that the mapper uses and that isn't marked `screen: false`. One
+        whose `when` can't hold (it names a setting that is neither a candidate nor at a listed value by default) is
+        left out (never used). only: these names instead (they may include `screen: false` ones)."""
         if only:
             bad = [k for k in only if k not in self.entries]
             if bad:
@@ -163,9 +252,10 @@ class Settings:
         out, left_out = {}, {}
         for k, e in self.entries.items():
             r = e.raw
-            if e.is_from or e.section == "nencarta" or "optimize" not in r:
+            if not self.screenable(e, mapper):
                 if only and k in only:
-                    raise SettingsError(f"{k} can't be screened (nencarta's, set by a stand-in, or no optimize field)")
+                    raise SettingsError(f"{k} can't be screened (nencarta's, set by a stand-in, or no range, choices "
+                                        "or switch)")
                 continue
             if only and k not in only:
                 continue
@@ -175,25 +265,28 @@ class Settings:
             if r.get("screen") is False and not only:
                 left_out[k] = "screen: false"
                 continue
-            if "range" not in r and "choices" not in r and not isinstance(self.default(k, mapper), bool):
-                left_out[k] = "no range"
-                continue
-            when = r.get("when")
-            if when and when not in out and not self.default(when, mapper):
-                left_out[k] = f"{when} is off"
-                continue
-            s = self.spec(e, mapper)
-            if plausible and "plausible" in r and s.kind == "float":
-                s = Spec(s.kind, *map(float, r["plausible"]), s.log, when=s.when)
-            out[k] = s
+            out[k] = self.spec(e, mapper)
+        left_out.update(self._drop_unused(out, mapper))
         return out, left_out
 
     def defaults(self, mapper: str) -> dict:
         """The default value of every searched parameter."""
         return {k: self.default(k, mapper) for k in self.space(mapper)}
 
-    def plausible(self) -> dict[str, tuple]:
-        return {k: tuple(e.raw["plausible"]) for k, e in self.entries.items() if "plausible" in e.raw}
+    def out_of_range(self, p: dict) -> dict[str, tuple]:
+        """The values of a parameter set outside their range (or not among their choices): {name: (value, range)}."""
+        out = {}
+        for k, v in p.items():
+            e = self.entries.get(k)
+            if e is None or v is None or isinstance(v, bool):
+                continue
+            if "range" in e.raw and isinstance(v, (int, float)):
+                lo, hi = e.raw["range"]
+                if not lo - 1e-9 <= v <= hi + 1e-9:
+                    out[k] = (v, (lo, hi))
+            elif "choices" in e.raw and v not in e.raw["choices"]:
+                out[k] = (v, tuple(e.raw["choices"]))
+        return out
 
     # ----------------------------------------------------------------------------------------------------------------
     # Cell size and stand-ins
@@ -240,16 +333,20 @@ class Settings:
 
     def model_args(self, p: dict, mapper: str, site: str | None) -> tuple[dict, dict, dict, dict]:
         """nencarta's options, arc_args, curve2flood_args and fldpln_library_args for one parameter set. An argument
-        is left out when its value is null, when its mapper is another, or while the switch it depends on is off."""
+        is left out when its value is null, when its mapper is another, or while its `when` doesn't hold (an ARC
+        argument a stand-in sets: the stand-in's)."""
         v = self.values(p, mapper)
+        value_of = lambda c: self.dem if c == DEM_KEY else v[c]   # noqa: E731
+
+        def passed(e: Entry) -> bool:
+            # A setting at null leaves it to the tool, which may use the argument: it is passed
+            return all(value_of(c) is None or holds({c: vals}, value_of) for c, vals in conditions(e.raw.get("when")))
+
         out = {s: {} for s in TOOL_SECTIONS}
         for k, e in self.entries.items():
             if e.section not in TOOL_SECTIONS or e.is_from or not self.applies(e, mapper):
                 continue
-            when = e.raw.get("when")
-            if when and not v[when]:
-                continue
-            if v[k] is None:
+            if not passed(e) or v[k] is None:
                 continue
             out[e.section][e.name] = v[k]
         derived = self.derived_args(v, self.cell_size_m(site))
@@ -257,7 +354,7 @@ class Settings:
             if e.section == "arc" and e.is_from:
                 if k in p:                              # a parameter set may set a stand-in's argument directly
                     out["arc"][e.name] = p[k]
-                elif e.name in derived:
+                elif e.name in derived and passed(self.entries[e.raw["from"]]):
                     out["arc"][e.name] = derived[e.name]
         neo = out["nencarta"]
         if neo.get("lakes"):
@@ -316,7 +413,7 @@ class Settings:
                 spec = self.spec(self.entries[name], mapper)
                 if "range" in raw:
                     lo, hi = raw["range"]
-                    spec = Spec(spec.kind, lo, hi, bool(raw.get("log", spec.log)))
+                    spec = numeric_spec(spec.kind, lo, hi, bool(raw.get("log", spec.log)), spec.step)
                 out[name] = {"scales": None, "spec": spec}
         return out
 
@@ -332,9 +429,7 @@ class Settings:
                 value = self.resolve(r.get("value"), mapper)
                 if k in space:
                     s = space[k]
-                    search = (f"{s.low} – {s.high}{' log' if s.log else ''}" if s.kind in ("float", "int")
-                              else "on/off" if s.kind == "bool" else "/".join(map(str, s.choices)))
-                    search += f" (when {s.when})" if s.when else ""
+                    search = describe_spec(s)
                 else:
                     search = ""
             rows.append({"section": e.section, "name": k, "value": value, "searched": search,
@@ -345,6 +440,31 @@ class Settings:
 # --------------------------------------------------------------------------------------------------------------------
 # Loading
 # --------------------------------------------------------------------------------------------------------------------
+
+def numeric_spec(kind: str, lo: float, hi: float, log: bool, step: float | None = None,
+                 when: str | None = None) -> Spec:
+    """The Spec of a number searched over [lo, hi]. With a step, its values are whole multiples of the step: the
+    range shrinks to the multiples inside it (on a log scale, at least one step)."""
+    if step:
+        k_lo, k_hi = math.ceil(lo / step - 1e-9), math.floor(hi / step + 1e-9)
+        if log:
+            k_lo = max(k_lo, 1)
+        if k_hi <= k_lo:
+            raise SettingsError(f"range [{lo:g}, {hi:g}] holds fewer than two steps of {step:g}")
+        lo, hi = k_lo * step, k_hi * step
+        if kind == "int":
+            lo, hi = int(round(lo)), int(round(hi))
+    return Spec(kind, lo, hi, log, when=when, step=step)
+
+
+def describe_spec(s: Spec) -> str:
+    """How a parameter is searched, in a few words."""
+    if s.kind in ("float", "int"):
+        out = f"{s.low:g} – {s.high:g}{' log' if s.log else ''}{f' step {s.step:g}' if s.step else ''}"
+    else:
+        out = "on/off" if s.kind == "bool" else "/".join(map(str, s.choices))
+    return out + (f" (when {describe_when(s.when)})" if s.when else "")
+
 
 def metres_to_cells(metres: float, cell: float) -> int:
     """A length along the stream in whole cells, at least 1 (halves round up)."""
@@ -371,6 +491,37 @@ def measured_cell_size(site: str, dem: str) -> float:
             dy *= 110574.0
         _MEASURED[key] = math.sqrt(dx * dy)
     return _MEASURED[key]
+
+
+def _check_when(s: Settings, where: str, when) -> None:
+    """A `when` names a switch, or maps settings to the values it needs: each a setting with a value in the file, and
+    each value one it can take (a switch true or false, a choice among its choices; null too)."""
+    if not (isinstance(when, str) and when) and not (isinstance(when, dict) and when):
+        raise SettingsError(f"{where}: when is a switch's name, or {{setting: value}} / {{setting: [values]}}, "
+                            f"not {when!r}")
+    for c, vals in conditions(when):
+        if c == DEM_KEY:
+            if isinstance(when, str):
+                raise SettingsError(f"{where}: when names the DEM: give the DEMs it needs, {{{DEM_KEY}: [...]}}")
+            bad = [x for x in vals if x not in s.nominal_cell_size]
+            if bad:
+                raise SettingsError(f"{where}: when gives {DEM_KEY} {bad}, which isn't a DEM of "
+                                    f"dem.nominal_cell_size_m ({sorted(s.nominal_cell_size)})")
+            continue
+        e = s.entries.get(c)
+        if e is None or e.is_from:
+            raise SettingsError(f"{where}: when names {c!r}, which isn't a setting with a value in the file")
+        r = e.raw
+        values = list(r["value"].values()) if isinstance(r.get("value"), dict) else [r.get("value")]
+        switch = (set(r["choices"]) <= {True, False} if "choices" in r
+                  else all(isinstance(x, bool) or x is None for x in values))
+        if isinstance(when, str) and not switch:
+            raise SettingsError(f"{where}: when names {c!r}, which isn't a switch: give the values it needs, "
+                                f"{{{c}: [...]}}")
+        allowed = [True, False] if switch else list(r.get("choices", []))
+        bad = [x for x in vals if x is not None and allowed and not any(_same(x, a) for a in allowed)]
+        if bad:
+            raise SettingsError(f"{where}: when gives {c} {bad}, which it can't take ({allowed})")
 
 
 def _check_entry(where: str, raw, allowed: set) -> dict:
@@ -431,18 +582,40 @@ def _validate(s: Settings) -> None:
             continue
         if "value" not in r:
             raise SettingsError(f"{where}: no value")
-        if r.get("when") and (r["when"] not in s.entries or s.entries[r["when"]].is_from):
-            raise SettingsError(f"{where}: when names {r['when']!r}, which isn't a setting with a value in the file")
+        if "when" in r:
+            _check_when(s, where, r["when"])
         if "screen" in r and not isinstance(r["screen"], bool):
             raise SettingsError(f"{where}: screen must be true or false")
         if r.get("mapper") not in (None, *ALL_MAPPERS):
             raise SettingsError(f"{where}: mapper must be one of {ALL_MAPPERS}")
+        if "range" in r:
+            if not (isinstance(r["range"], list) and len(r["range"]) == 2 and r["range"][0] < r["range"][1]):
+                raise SettingsError(f"{where}: range must be [low, high]")
+            if r.get("log") and r["range"][0] <= 0:
+                raise SettingsError(f"{where}: a log range must be above 0")
+        if "step" in r:
+            if "range" not in r:
+                raise SettingsError(f"{where}: step needs a range")
+            for mapper in config.MAPPERS:
+                try:
+                    step = s.step_size(r, mapper)
+                    if step is not None and not step > 0:
+                        raise SettingsError(f"step must be cell or a number above 0, not {step!r}")
+                    if step is not None:
+                        numeric_spec("float", *r["range"], bool(r.get("log")), step)
+                except (SettingsError, ValueError, TypeError) as exc:
+                    raise SettingsError(f"{where}: {exc}") from None
         for mapper in config.MAPPERS:
             try:
                 v = s.resolve(r.get("value"), mapper)
                 opt = s.resolve(r.get("optimize", False), mapper)
             except SettingsError as exc:
                 raise SettingsError(f"{where}: {exc}") from None
+            if s.applies(e, mapper) and v is not None and not isinstance(v, bool):
+                if "range" in r and isinstance(v, (int, float)) and not r["range"][0] <= v <= r["range"][1]:
+                    raise SettingsError(f"{where}: value {v:g} ({mapper}) is outside its range {r['range']}")
+                if "choices" in r and v not in r["choices"]:
+                    raise SettingsError(f"{where}: value {v!r} ({mapper}) is not one of its choices {r['choices']}")
             if not opt or not s.applies(e, mapper):
                 continue
             if e.section == "nencarta":
@@ -450,18 +623,13 @@ def _validate(s: Settings) -> None:
                                     "optimized")
             if "range" not in r and "choices" not in r and not isinstance(v, bool):
                 raise SettingsError(f"{where}: optimize needs a range (numbers) or choices")
-            if "range" in r:
-                lo, hi = r["range"]
-                if not lo < hi:
-                    raise SettingsError(f"{where}: range must be [low, high]")
-                if r.get("log") and lo <= 0:
-                    raise SettingsError(f"{where}: a log range must be above 0")
     for g, args in DERIVED_GROUPS.items():
         native = [a for a in args if a in s.entries and not s.entries[a].is_from]
         for mapper in config.MAPPERS:
             if native and s.optimized(s.entries[g], mapper):
                 raise SettingsError(f"derived.{g} is searched, but arc sets {native} directly: set {g}'s optimize to "
                                     "false, or put `from` back")
+    dependence_order({k: e.raw.get("when") for k, e in s.entries.items() if not e.is_from})   # no circles
     for name, raw in s.persite_raw.items():
         _check_entry(f"persite.{name}", raw, PERSITE_FIELDS)
         if "scales" in raw:

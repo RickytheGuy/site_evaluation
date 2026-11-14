@@ -162,9 +162,12 @@ def site_attributes(site: str, run_dir: Path) -> dict:
 def attributes(mapper: str, p: dict | None = None, workers: int = 8, log=print) -> pd.DataFrame:
     """Run every site once (method "attributes") and compute site_attributes from each worker's folder."""
     from .runner import Runner
+    from .progress import Progress
     p = params.complete(p or {}, mapper)
-    with Runner(mapper, workers) as runner:
-        recs = runner.evaluate(p, sites.all_sites(), None, method="attributes", tag="attributes")
+    site_list = sites.all_sites()
+    with Runner(mapper, workers) as runner, Progress(len(site_list), "attributes", "site", log) as bar:
+        recs = runner.evaluate(p, site_list, None, method="attributes", tag="attributes",
+                               progress=lambda s, r: bar.update())
     rows = []
     for s, r in recs.items():
         try:

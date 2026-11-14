@@ -110,14 +110,25 @@ def prepare(mapper: str, site_list: list[str], workers: int = 30, log=print) -> 
     out.mkdir(parents=True, exist_ok=True)
     (out / ".token").unlink(missing_ok=True)
     log(f"preparing {len(site_list)} sites for {mapper} on {S.dem} into {out}")
+    from .progress import Progress, worker_init
     t0 = time.time()
     failed = []
-    with ProcessPoolExecutor(min(workers, len(site_list)), mp_context=mp.get_context("forkserver")) as pool:
-        tasks = [(s, mapper, str(S.path)) for s in site_list]
-        for site, err in zip(site_list, pool.map(prepare_site, tasks, chunksize=1)):
-            log(f"  {site:<70} {'FAILED: ' + err if err else 'ok'}")
-            if err:
-                failed.append(site)
+    pool = ProcessPoolExecutor(min(workers, len(site_list)), mp_context=mp.get_context("forkserver"),
+                               initializer=worker_init)
+    try:
+        with Progress(len(site_list), f"prepare {mapper}", "site", log) as bar:
+            tasks = [(s, mapper, str(S.path)) for s in site_list]
+            for site, err in zip(site_list, pool.map(prepare_site, tasks, chunksize=1)):
+                if err:
+                    bar.write(f"  {site:<70} FAILED: {err}")
+                    failed.append(site)
+                bar.update()
+    except BaseException:
+        pool.terminate_workers()
+        pool.shutdown(wait=True, cancel_futures=True)
+        log("Stopped: the cache is incomplete, so runs refuse it until prepare finishes.")
+        raise
+    pool.shutdown()
     (out / ".token").write_text(f"{time.time():.0f}")
     log(f"prepared {len(site_list) - len(failed)}/{len(site_list)} sites in {(time.time() - t0) / 60:.1f} min"
         + (f"; failed: {failed}" if failed else ""))

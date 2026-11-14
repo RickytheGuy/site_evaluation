@@ -102,14 +102,17 @@ def presets() -> list[str]:
     return sorted(f.stem for f in PRESETS.glob("*.json")) + ["reference"]
 
 
-def switch_on(p: dict, name: str, mapper: str) -> bool:
-    """Whether a switch is on in a parameter set, or in the settings file when the set leaves it out."""
-    return bool(p[name] if name in p else settings.current().default(name, mapper))
+def active(p: dict, when, mapper: str) -> bool:
+    """Whether a parameter's `when` holds in a parameter set (a setting the set leaves out: at its default in the
+    settings file). A setting at null meets a condition only where null is listed."""
+    S = settings.current()
+    return settings.holds(when, lambda k: p[k] if k in p else S.default(k, mapper))
 
 
-def is_plausible(p: dict) -> bool:
-    """Whether every value with a plausible band in the settings file lies inside it."""
-    return all(lo - 1e-9 <= p[k] <= hi + 1e-9 for k, (lo, hi) in settings.current().plausible().items() if k in p)
+def in_range(p: dict) -> bool:
+    """Whether every value of a set lies in its range (or among its choices) in the settings file: sets from studies
+    with wider ranges may not."""
+    return not settings.current().out_of_range(convert_legacy(p))
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -118,8 +121,8 @@ def is_plausible(p: dict) -> bool:
 
 def from_unit(u, mapper: str, names: list[str] | None = None, sp: dict | None = None) -> dict:
     """A parameter set from a point of the unit cube, one coordinate per name (in order). A switch is on above 0.5,
-    a choice takes the bin its coordinate falls in; conditional parameters are kept even when their switch is off
-    (they are then unused). sp: the specs to use (default: the mapper's search space)."""
+    a choice takes the bin its coordinate falls in, a number takes value_at; conditional parameters are kept even when
+    their switch is off (they are then unused). sp: the specs to use (default: the mapper's search space)."""
     sp = sp or space(mapper)
     names = names or list(sp)
     p = {}
@@ -131,10 +134,19 @@ def from_unit(u, mapper: str, names: list[str] | None = None, sp: dict | None = 
         elif s.kind == "choice":
             p[name] = s.choices[min(int(x * len(s.choices)), len(s.choices) - 1)]
         else:
-            lo, hi = s.low, s.high
-            v = np.exp(np.log(lo) + x * (np.log(hi) - np.log(lo))) if s.log else lo + x * (hi - lo)
-            p[name] = int(np.clip(round(v), lo, hi)) if s.kind == "int" else float(v)
+            p[name] = value_at(x, s)
     return p
+
+
+def value_at(x: float, s: settings.Spec):
+    """A number's value at x of [0, 1] across its range: on a log scale if s.log, rounded to whole steps if s.step
+    (on a log scale, the steps are then spread log-uniformly), and to a whole number if s.kind is int."""
+    lo, hi = s.low, s.high
+    x = float(np.clip(x, 0.0, 1.0))
+    v = np.exp(np.log(lo) + x * (np.log(hi) - np.log(lo))) if s.log else lo + x * (hi - lo)
+    if s.step:
+        v = np.clip(round(v / s.step), round(lo / s.step), round(hi / s.step)) * s.step
+    return int(np.clip(round(v), lo, hi)) if s.kind == "int" else float(v)
 
 
 def to_unit(p: dict, mapper: str, names: list[str] | None = None, sp: dict | None = None) -> np.ndarray:
@@ -182,7 +194,7 @@ def describe(p: dict, mapper: str) -> str:
     out = []
     for k, v in p.items():
         s = sp.get(k)
-        if s is not None and s.when and not switch_on(p, s.when, mapper):
+        if s is not None and s.when and not active(p, s.when, mapper):
             continue
         out.append(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}")
     return " ".join(out)

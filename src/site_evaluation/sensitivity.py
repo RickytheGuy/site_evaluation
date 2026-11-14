@@ -2,23 +2,39 @@
 Which parameters to calibrate (``site-eval sensitivity``): a global screening of every candidate parameter, then a
 test of whether the influential ones can be calibrated together.
 
-Candidates (Settings.candidates): every argument in the settings file with an optimize field, true or false, that the
-mapper uses, except nencarta's (they shape the cached preprocessing) and those marked ``screen: false`` (fixed
-beforehand, such as Standard_Step on physical grounds). Each is screened over its range (a log range on the log scale).
+Candidates (Settings.candidates): every argument in the settings file with a range or choices, and every switch
+(true/false with an optimize field), that the mapper uses, except nencarta's (they shape the cached preprocessing) and
+those marked ``screen: false`` (fixed beforehand, such as Standard_Step on physical grounds). Each is screened over its
+range (a log range on the log scale).
 
 1. Screening: the elementary effects method (Morris 1991) with μ* (Campolongo et al. 2007).
    r trajectories cross a grid of 4 levels per parameter. Each step of a trajectory moves one parameter by
    Δ = 2/3 of its range (a switch is flipped, a choice changes). A step's effect is the change in the objective, the
    mean MCC of the study's sites (by default the calibration sites), signed for a rise of the parameter. Per
    parameter: μ* = the mean |effect| (its influence), μ = the mean effect (its direction), σ = the effects' standard
-   deviation (non-linearity and interactions), and a bootstrap 95% interval of μ* over the trajectories. Against a
-   threshold (0.01 MCC by default: a smaller change is no change):
-       influential   the interval lies above the threshold
-       negligible    the interval lies below it: fix the parameter at its default
-       undecided     the interval straddles it: run more trajectories
-   A step taken while the switch a parameter depends on is off has no effect and is left out. "site μ*" is the mean
-   of each site's own μ*: far above μ*, the parameter moves each site but in different directions, so a single
-   general value gains little from it (a per-site candidate).
+   deviation (non-linearity and interactions), and a bootstrap 95% interval of μ* over the trajectories.
+   The mean can hide a parameter that moves many sites, some up and some down. So each step's change at every site
+   is kept too: "site μ*" is a site's mean |change| (averaged over the sites), with its own bootstrap interval, and
+   "moved" is the number of sites a step changes by the threshold or more (up/down). Against a threshold (0.01 MCC by
+   default: a smaller change is no change):
+       influential         μ*'s interval lies above the threshold
+       undecided           μ*'s interval straddles it: more trajectories (rounds, below)
+       trades sites        μ*'s interval lies below it, site μ*'s above: the mean doesn't move, but the sites do,
+                           both ways. Its value picks which sites do well, so it is set on physical grounds or tied
+                           to what the sites it helps share, not fixed as if it changed nothing
+       undecided (sites)   μ*'s interval lies below it, site μ*'s straddles it: more trajectories
+       negligible          both intervals lie below it: fix the parameter at its default
+   Fewer than MIN_EFFECTS effects leave a parameter undecided. A step taken while the setting a parameter depends on
+   (its `when`) doesn't hold has no effect and is left out. The site effects (each site's μ and μ*) are saved to
+   <study>_site_effects.csv.
+
+   Rounds (more_trajectories). After the r full trajectories, the undecided parameters (either kind, or never
+   active) get r more trajectories that move only them, and are classified again, until none is left or each has
+   max_trajectories (60 by default). A round's trajectory starts at a random grid point of every parameter, like a
+   full one, and the parameters it doesn't move stay there, so its effects are drawn as a full trajectory's are and
+   pool with them; it costs len(undecided)+1 runs instead of k+1. Looking at the intervals after each round (up to
+   three times by default) makes a wrong call somewhat likelier than 5% for a parameter whose μ* sits at the
+   threshold, where either call changes little.
 
 2. Identifiability: the collinearity index of Brun et al. (2001), at a reference set (the settings file's defaults).
    Each influential or undecided number is moved ±step of its range. The change in every site's MCC at every stage,
@@ -37,7 +53,7 @@ beforehand, such as Standard_Step on physical grounds). Each is screened over it
    test is local: it holds near the reference set.
 
    Positive control. slope_adjustment_factor multiplies every conveyance, so it gives exactly the maps of dividing
-   every n by it: a structural duplicate, fixed beforehand (screen: false). Every collinearity test also moves it
+   every n by it: a structural duplicate. Every collinearity test also moves it
    and each n class, and reports how collinear the method finds it with the n values on these sites. On six test
    sites that was γ ≈ 6 (R² 0.97), not infinity: a set whose γ is near the control's is as confounded as an exact
    duplicate on this output, hence the default γ_crit of 5.
@@ -68,14 +84,13 @@ import hashlib
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import config, params, scoring, settings
+from . import config, params, progress, scoring, settings
 
 LEVELS = 4
 DELTA = LEVELS / (2 * (LEVELS - 1))          # 2/3: a Morris step moves a parameter by this share of its range
@@ -116,11 +131,31 @@ def specs_of(header: dict) -> dict[str, settings.Spec]:
 # Designs
 # --------------------------------------------------------------------------------------------------------------------
 
-def morris_design(names: list[str], r: int, seed: int) -> list[dict]:
+def morris_design(names: list[str], r: int, seed: int, rnd: dict | None = None) -> list[dict]:
     """r Morris trajectories of len(names)+1 points on the unit cube. Trajectory t depends only on (seed, t), so a
-    study can be extended with more trajectories."""
+    study can be extended with more trajectories.
+
+    With rnd (a round, from Study.rounds), its trajectories instead: each starts at a random grid point of every
+    parameter, as above, but steps only the round's parameters, so it takes len(rnd["names"])+1 points. The others
+    stay at their random levels, so each effect is taken at a random point of the whole space, as in a full
+    trajectory, and the two pool."""
     k = len(names)
     out = []
+    if rnd is not None:
+        n_round, moved = rnd["round"], np.array([names.index(n) for n in rnd["names"]])
+        for t in range(rnd["trajectories"]):
+            rng = np.random.default_rng([seed, 1000 + n_round, t])
+            x = rng.integers(0, LEVELS, k) / (LEVELS - 1)
+            pre = f"x{n_round}.{t}"
+            out.append({"kind": "morris", "key": f"{pre}.0", "round": n_round, "traj": t, "step": 0,
+                        "unit": x.round(6).tolist(), "moved": None, "sign": 0})
+            for i, j in enumerate(rng.permutation(moved), 1):
+                x = x.copy()
+                sign = 1 if x[j] + DELTA <= 1 + 1e-9 else -1
+                x[j] = x[j] + sign * DELTA
+                out.append({"kind": "morris", "key": f"{pre}.{i}", "round": n_round, "traj": t, "step": i,
+                            "unit": x.round(6).tolist(), "moved": names[int(j)], "sign": sign})
+        return out
     for t in range(r):
         rng = np.random.default_rng([seed, t])
         x = rng.integers(0, LEVELS, k) / (LEVELS - 1)
@@ -137,7 +172,8 @@ def morris_design(names: list[str], r: int, seed: int) -> list[dict]:
 
 def local_design(ref: dict, names: list[str], specs: dict, mapper: str, step: float) -> tuple[list[dict], dict]:
     """The reference set, and each number moved up and down by step of its range (one side only at a bound; at
-    least one whole number for an integer). Also the names left out, with the reason."""
+    least one whole number for an integer, one step for a number with a step). Also the names left out, with the
+    reason."""
     rh = _hash({"ref": ref, "step": step})
     pts = [{"kind": "local", "key": f"L{rh}.base", "ref": rh, "moved": None, "params": ref}]
     skipped = {}
@@ -146,8 +182,8 @@ def local_design(ref: dict, names: list[str], specs: dict, mapper: str, step: fl
         if s.kind not in ("float", "int"):
             skipped[n] = "a switch or choice"
             continue
-        if s.when and not params.switch_on(ref, s.when, mapper):
-            skipped[n] = f"{s.when} is off at the reference"
+        if s.when and not params.active(ref, s.when, mapper):
+            skipped[n] = f"unused at the reference (needs {settings.describe_when(s.when)})"
             continue
         u0 = float(params.to_unit(ref, mapper, [n], specs)[0])
         for sign in (1, -1):
@@ -155,9 +191,10 @@ def local_design(ref: dict, names: list[str], specs: dict, mapper: str, step: fl
             if abs(u - u0) < 1e-9:
                 continue
             v = params.from_unit([u], mapper, [n], specs)[n]
-            if s.kind == "int":
+            grain = s.step or (1 if s.kind == "int" else None)
+            if grain:
                 if v == ref[n]:
-                    v = int(np.clip(ref[n] + sign, s.low, s.high))
+                    v = type(v)(np.clip(ref[n] + sign * grain, s.low, s.high))
                 if v == ref[n]:
                     continue
             pts.append({"kind": "local", "key": f"L{rh}.{n}{'+' if sign > 0 else '-'}", "ref": rh, "moved": n,
@@ -179,8 +216,7 @@ class Study:
         self.rows: dict[str, dict] = {}
         self.header = None
         if self.path.exists():
-            with open(self.path) as f:
-                lines = [json.loads(line) for line in f if line.strip()]
+            lines = progress.read_jsonl(self.path, repair=header is not None)   # repair only to append
             self.header = lines[0]
             self.rows = {r["key"]: r for r in lines[1:]}
         if header is not None:
@@ -200,17 +236,16 @@ class Study:
         self.specs = specs_of(self.header)
         self.sites: list[str] = self.header["sites"]
 
-    def run(self, points: list[dict], workers: int, jobs: int, log=print) -> None:
-        """Run the points not run yet, jobs parameter sets at a time."""
+    def run(self, points: list[dict], workers: int, jobs: int, log=print, desc: str = "runs") -> None:
+        """Run the points not run yet, jobs parameter sets at a time. Each finished one is saved at once, so a stopped
+        study continues where it stopped. The first Ctrl-C lets the running sets finish; a second stops at once."""
         todo = [pt for pt in points if pt["key"] not in self.rows]
         if not todo:
             return
         from .runner import Runner
         lock = threading.Lock()
-        t0, count = time.time(), [0]
-        every = max(1, len(todo) // 20)
         log(f"[{_stamp()}] {len(todo)} runs of {len(self.sites)} sites ({len(points) - len(todo)} done before)")
-        with Runner(self.mapper, workers) as runner:
+        with Runner(self.mapper, workers) as runner, progress.Progress(len(todo), desc, "run", log) as bar:
             def one(pt):
                 recs = runner.evaluate(pt["params"], self.sites, None, archive=False)
                 if not any(r.get("ok") for r in recs.values()):
@@ -226,75 +261,176 @@ class Study:
                     with open(self.path, "a") as f:
                         f.write(json.dumps(row, default=float) + "\n")
                     self.rows[pt["key"]] = row
-                    count[0] += 1
-                    if count[0] % every == 0 or count[0] == len(todo):
-                        el = time.time() - t0
-                        left = el / count[0] * (len(todo) - count[0])
-                        log(f"[{_stamp()}] {count[0]}/{len(todo)} runs, {el / 60:.0f} min, ~{left / 60:.0f} min left")
+                bar.update()
 
-            with ThreadPoolExecutor(jobs) as ex:
-                list(ex.map(one, todo))
+            try:
+                progress.thread_map(one, todo, jobs, bar.write)
+            except KeyboardInterrupt:
+                done = sum(pt["key"] in self.rows for pt in points)
+                bar.write(f"Stopped: {done} of {len(points)} runs are saved in {self.path}. The same command "
+                          "continues from there.")
+                raise
 
     def failures(self) -> int:
         return sum(len(r.get("failed", [])) for r in self.rows.values())
+
+    def rounds(self) -> list[dict]:
+        """The rounds of more trajectories planned so far, in order: round, names, trajectories."""
+        return sorted((r for r in self.rows.values() if r["kind"] == "round"), key=lambda r: r["round"])
+
+    def add_round(self, names: list[str], trajectories: int) -> dict:
+        """Plan a round (saved before it runs, so a stopped round continues with the same parameters)."""
+        n = len(self.rounds()) + 1
+        row = {"kind": "round", "key": f"round{n}", "round": n, "names": names, "trajectories": trajectories,
+               "time": time.time()}
+        with open(self.path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+        self.rows[row["key"]] = row
+        return row
 
 
 # --------------------------------------------------------------------------------------------------------------------
 # 1. Screening
 # --------------------------------------------------------------------------------------------------------------------
 
-def morris_effects(study: Study) -> pd.DataFrame:
-    """One row per elementary effect of the complete trajectories: traj, name, effect (the objective's change for a
-    rise of Δ), and each site's change in score."""
+def _trajectories(study: Study) -> list[tuple[str, list[str]]]:
+    """Each trajectory's label and keys: the full ones (m<t>.<i>), then each round's (x<round>.<t>.<i>)."""
     k = len(study.names)
-    trajs = sorted({r["traj"] for r in study.rows.values() if r["kind"] == "morris"})
+    full = sorted({r["traj"] for r in study.rows.values() if r["kind"] == "morris" and not r.get("round")})
+    out = [(f"m{t}", [f"m{t}.{i}" for i in range(k + 1)]) for t in full]
+    for rd in study.rounds():
+        out += [(f"x{rd['round']}.{t}", [f"x{rd['round']}.{t}.{i}" for i in range(len(rd["names"]) + 1)])
+                for t in range(rd["trajectories"])]
+    return out
+
+
+def morris_effects(study: Study) -> pd.DataFrame:
+    """One row per elementary effect of the complete trajectories (full ones and rounds'): traj, name, effect (the
+    objective's change for a rise of Δ), and each site's change in score."""
     out = []
-    for t in trajs:
-        steps = [study.rows.get(f"m{t}.{i}") for i in range(k + 1)]
+    for label, keys in _trajectories(study):
+        steps = [study.rows.get(key) for key in keys]
         if any(s is None for s in steps):
             continue
         for prev, cur in zip(steps, steps[1:]):
             n = cur["moved"]
             spec = study.specs[n]
-            if spec.when and not params.switch_on(prev["params"], spec.when, study.mapper):
+            if spec.when and not params.active(prev["params"], spec.when, study.mapper):
                 continue
             sign = cur["sign"]
-            out.append({"traj": t, "name": n, "effect": sign * (cur["value"] - prev["value"]),
+            out.append({"traj": label, "name": n, "effect": sign * (cur["value"] - prev["value"]),
                         **{s: sign * (cur["sites"][s] - prev["sites"][s]) for s in study.sites}})
     return pd.DataFrame(out)
 
 
 def complete_trajectories(study: Study) -> int:
+    """The number of complete full trajectories (those that move every parameter)."""
     k = len(study.names)
-    trajs = {r["traj"] for r in study.rows.values() if r["kind"] == "morris"}
+    trajs = {r["traj"] for r in study.rows.values() if r["kind"] == "morris" and not r.get("round")}
     return sum(all(f"m{t}.{i}" in study.rows for i in range(k + 1)) for t in trajs)
 
 
+def trajectory_counts(study: Study) -> dict[str, int]:
+    """Per parameter: the complete trajectories that move it, full ones and rounds' together."""
+    counts = dict.fromkeys(study.names, complete_trajectories(study))
+    for rd in study.rounds():
+        done = sum(all(f"x{rd['round']}.{t}.{i}" in study.rows for i in range(len(rd["names"]) + 1))
+                   for t in range(rd["trajectories"]))
+        for n in rd["names"]:
+            counts[n] += done
+    return counts
+
+
+NEEDS_MORE = ("undecided", "undecided (sites)", "never active")
+
+
+def more_trajectories(study: Study, specs: dict, mapper: str, r: int, max_trajectories: int, threshold: float,
+                      workers: int, jobs: int, log=print) -> None:
+    """Rounds of more trajectories for the parameters that need them: run the rounds planned before (a stopped one
+    continues), then, while some parameter is undecided (on the mean or the sites) or never active, and moved by
+    fewer than max_trajectories trajectories, plan another round of r trajectories (fewer near the cap) that moves
+    only those parameters, run it, and classify again. A parameter's class only changes when it is moved again, so a
+    decided one stays decided."""
+    while True:
+        for rd in study.rounds():
+            pts = morris_design(study.names, 0, study.header["seed"], rd)
+            for pt in pts:
+                pt["params"] = params.from_unit(pt["unit"], mapper, study.names, specs)
+            study.run(pts, workers, jobs, log, f"round {rd['round']}")
+        counts = trajectory_counts(study)
+        df = screening_table(study, threshold)
+        need = set(df.loc[df["class"].isin(NEEDS_MORE), "parameter"])
+        need = [n for n in study.names if n in need and counts[n] < max_trajectories]
+        if not need:
+            return
+        size = min(r, max_trajectories - max(counts[n] for n in need))
+        rd = study.add_round(need, size)
+        log(f"[{_stamp()}] round {rd['round']}: {size} more trajectories ({size * (len(need) + 1)} runs) for "
+            f"{len(need)} undecided: {', '.join(need)}")
+
+
+def classify(n: int, mean_ci: tuple[float, float], site_ci: tuple[float, float], threshold: float) -> str:
+    """A candidate's class from the 95% intervals of μ* (the sites' mean MCC) and of site μ* (a site's MCC). The mean
+    decides first; only a parameter whose effect on the mean is negligible is judged on the sites, so that one which
+    moves sites both ways, cancelling in the mean, isn't fixed as if it changed nothing."""
+    if n < MIN_EFFECTS:
+        return "undecided"
+    if mean_ci[0] >= threshold:
+        return "influential"
+    if mean_ci[1] >= threshold:
+        return "undecided"
+    if site_ci[0] >= threshold:
+        return "trades sites"
+    return "negligible" if site_ci[1] < threshold else "undecided (sites)"
+
+
 def screening_table(study: Study, threshold: float = 0.01, n_boot: int = 2000, seed: int = 0) -> pd.DataFrame:
-    """Per candidate: μ*, its bootstrap 95% interval, μ, σ, site μ*, the site it moves most, the number of effects,
-    and its class. Sorted by μ*."""
+    """Per candidate: μ*, its bootstrap 95% interval, μ, σ; site μ* (a site's mean |change|) and its interval; the
+    number of sites a step moves by the threshold or more (up, down); the site it moves most; the number of effects;
+    and its class (classify). Sorted by μ*."""
     eff = morris_effects(study)
     rng = np.random.default_rng(seed)
     rows = []
     for n in study.names:
         spec = study.specs[n]
         e = eff[eff["name"] == n] if len(eff) else eff
-        base = {"parameter": n, "kind": spec.kind + (f" (when {spec.when})" if spec.when else ""), "n": len(e)}
+        base = {"parameter": n, "kind": spec.kind + (f" (when {settings.describe_when(spec.when)})" if spec.when else ""), "n": len(e)}
         if len(e) == 0:
             rows.append({**base, "class": "never active"})
             continue
         d = e["effect"].to_numpy(float)
         a = np.abs(d)
-        boot = a[rng.integers(0, len(a), (n_boot, len(a)))].mean(axis=1)
-        lo, hi = np.percentile(boot, [2.5, 97.5])
+        D = e[study.sites].to_numpy(float)           # each step's signed change at each site
+        m = np.nanmean(np.abs(D), axis=1)            # each step's mean |site change|
+        idx = rng.integers(0, len(a), (n_boot, len(a)))
+        lo, hi = np.percentile(a[idx].mean(axis=1), [2.5, 97.5])
+        slo, shi = np.percentile(m[idx].mean(axis=1), [2.5, 97.5])
         per_site = e[study.sites].abs().mean(axis=0)
-        cls = ("undecided" if len(a) < MIN_EFFECTS else "influential" if lo >= threshold
-               else "negligible" if hi < threshold else "undecided")
         rows.append({**base, "mu_star": a.mean(), "ci_low": lo, "ci_high": hi, "mu": d.mean(),
                      "sigma": d.std(ddof=1) if len(d) > 1 else np.nan, "site_mu_star": float(per_site.mean()),
-                     "top_site": per_site.idxmax(), "top_site_mu_star": float(per_site.max()), "class": cls})
+                     "site_ci_low": slo, "site_ci_high": shi,
+                     "sites_moved": float((np.abs(D) >= threshold).sum(axis=1).mean()),
+                     "sites_up": float((D >= threshold).sum(axis=1).mean()),
+                     "sites_down": float((D <= -threshold).sum(axis=1).mean()),
+                     "top_site": per_site.idxmax(), "top_site_mu_star": float(per_site.max()),
+                     "class": classify(len(a), (lo, hi), (slo, shi), threshold)})
     df = pd.DataFrame(rows)
     return df.sort_values("mu_star", ascending=False, na_position="last").reset_index(drop=True)
+
+
+def site_effects(study: Study) -> pd.DataFrame:
+    """Per candidate and site: the number of effects, the mean signed change in the site's MCC for a rise of the
+    parameter (μ) and the mean |change| (μ*). Which sites a parameter helps and hurts."""
+    eff = morris_effects(study)
+    if not len(eff):
+        return pd.DataFrame(columns=["parameter", "site", "n", "mu", "mu_star"])
+    g = eff.groupby("name", sort=False)[study.sites]
+    mu = g.mean().stack().rename("mu")
+    mu_star = eff[study.sites].abs().groupby(eff["name"], sort=False).mean().stack().rename("mu_star")
+    n = g.count().stack().rename("n")
+    out = pd.concat([n, mu, mu_star], axis=1).reset_index()
+    out.columns = ["parameter", "site", "n", "mu", "mu_star"]
+    return out
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -402,20 +538,29 @@ def print_screening(df: pd.DataFrame, study: Study, threshold: float, digits: in
     k = len(study.names)
     print(f"\nScreening: {study.mapper} on {study.header['dem']}, {len(study.sites)} sites, {k} parameters, {r} Morris "
           f"trajectories ({r * (k + 1)} runs)")
+    for rd in study.rounds():
+        print(f"  round {rd['round']}: {rd['trajectories']} more trajectories of the {len(rd['names'])} that needed "
+              f"them ({rd['trajectories'] * (len(rd['names']) + 1)} runs)")
     print(f"effect = change in the sites' mean MCC when a parameter rises by 2/3 of its range (a switch: turned on); "
           f"threshold {threshold}")
+    print(f"site μ* = a site's mean |change in MCC|; moved = sites a step changes by {threshold} or more (up/down), "
+          f"of {len(study.sites)}")
     w = max(len(n) for n in df["parameter"])
-    print(f"{'parameter':<{w}}  {'μ*':>6}  {'95% interval':>14}  {'μ':>6}  {'σ':>6}  {'site μ*':>7}  {'n':>3}  class"
-          f"         most moved site")
+    print(f"{'parameter':<{w}}  {'μ*':>6}  {'95% interval':>14}  {'μ':>6}  {'σ':>6}  {'site μ*':>7}  "
+          f"{'site interval':>14}  {'moved (up/dn)':>13}  {'n':>3}  {'class':<17}  most moved site")
     for _, x in df.iterrows():
         if x["class"] == "never active":
-            print(f"{x['parameter']:<{w}}  {'':>6}  {'':>14}  {'':>6}  {'':>6}  {'':>7}  {0:>3}  never active "
-                  f"({x['kind']})")
+            print(f"{x['parameter']:<{w}}  {'':>6}  {'':>14}  {'':>6}  {'':>6}  {'':>7}  {'':>14}  {'':>13}  {0:>3}  "
+                  f"never active ({x['kind']})")
             continue
         ci = f"[{_f(x['ci_low'], digits)}, {_f(x['ci_high'], digits)}]"
+        sci = f"[{_f(x['site_ci_low'], digits)}, {_f(x['site_ci_high'], digits)}]"
+        c = lambda v: "<1" if 0 < v < 0.5 else f"{v:.0f}"      # a mean count per step
+        moved = f"{c(x['sites_moved'])} ({c(x['sites_up'])}/{c(x['sites_down'])})"
         top = f"{x['top_site'][:34]} ({_f(x['top_site_mu_star'], digits)})"
         print(f"{x['parameter']:<{w}}  {_f(x['mu_star'], digits):>6}  {ci:>14}  {_f(x['mu'], digits):>6}  "
-              f"{_f(x['sigma'], digits):>6}  {_f(x['site_mu_star'], digits):>7}  {x['n']:>3}  {x['class']:<12}  {top}")
+              f"{_f(x['sigma'], digits):>6}  {_f(x['site_mu_star'], digits):>7}  {sci:>14}  {moved:>13}  "
+              f"{x['n']:>3}  {x['class']:<17}  {top}")
 
 
 def print_identifiability(res: dict, ref_desc: str, step: float, gamma_crit: float, skipped: dict,
@@ -482,7 +627,8 @@ def print_control(ctrl: dict | None, gamma_crit: float) -> None:
           + ("." if ctrl["gamma"] > gamma_crit else f"; γ_crit {gamma_crit:g} is above that, so lower --gamma."))
 
 
-def print_summary(df: pd.DataFrame, res: dict | None, threshold: float, trajectories: int) -> None:
+def print_summary(df: pd.DataFrame, res: dict | None, threshold: float, counts: dict[str, int], r: int) -> None:
+    """The suggestions. counts: the trajectories that moved each parameter; r: the trajectories of a round."""
     def names(cls, numbers=None):
         sel = df[df["class"] == cls]
         return [n for n, k in zip(sel["parameter"], sel["kind"])
@@ -507,40 +653,54 @@ def print_summary(df: pd.DataFrame, res: dict | None, threshold: float, trajecto
         print(f"  influential numbers: {', '.join(infl) or '—'}")
     if names("influential", False):
         print(f"  switches / choices: {', '.join(names('influential', False))} (influential: compare their settings)")
+    trade, und_sites = names("trades sites"), names("undecided (sites)")
+    if trade:
+        print(f"  trades sites:       {', '.join(trade)} (no change in the mean MCC, but sites move both ways: its value "
+              f"picks which sites do well; set it on physical grounds, or see which sites it moves in "
+              f"_site_effects.csv)")
+    if und or und_sites:
+        most = max(counts.get(n, 0) for n in und + und_sites)
+        more = f"after {most} trajectories; another round: --max-trajectories {most + r}"
     if und:
-        print(f"  undecided:          {', '.join(und)} (more trajectories: --trajectories {2 * trajectories})")
+        print(f"  undecided:          {', '.join(und)} ({more})")
+    if und_sites:
+        print(f"  undecided (sites):  {', '.join(und_sites)} (no change in the mean MCC; unclear whether they move "
+              f"sites; {more})")
     neg = names("negligible")
-    print(f"  fix at default:     {len(neg)} negligible (μ* interval below {threshold}): {', '.join(neg) or '—'}")
+    print(f"  fix at default:     {len(neg)} negligible (μ* and site μ* intervals below {threshold}): "
+          f"{', '.join(neg) or '—'}")
     if names("never active"):
         print(f"  never active:       {', '.join(names('never active'))}")
 
 
 def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int = 0, threshold: float = 0.01,
-        stage: str = "both", only: list[str] | None = None, plausible: bool = False, identify: list[str] | None = None,
+        stage: str = "both", only: list[str] | None = None, identify: list[str] | None = None,
         reference: str | None = None, step: float = 0.1, gamma_crit: float = 5.0, prefer: list[str] | None = None,
         site_list: list[str] | None = None, workers: int = 30, jobs: int = 4, dry_run: bool = False,
-        digits: int = 2, log=None) -> None:
+        digits: int = 2, max_trajectories: int = 60, log=None) -> None:
     from . import sites
     log = log or (lambda *x: print(*x, flush=True))
     S = settings.current()
-    name = name or S.dem + ("_plausible" if plausible else "")
+    name = name or S.dem
     site_list = site_list or sites.calib_sites()
-    specs, left_out = S.candidates(mapper, plausible, only)
+    specs, left_out = S.candidates(mapper, only)
     if not specs:
         raise SystemExit("no candidates to screen")
     names = list(specs)
     header = {"kind": "header", "mapper": mapper, "dem": S.dem, "names": names,
               "specs": {k: asdict(v) for k, v in specs.items()}, "sites": site_list, "seed": seed,
               "setup": setup_fingerprint(mapper, specs), "levels": LEVELS, "settings": str(S.path),
-              "plausible": plausible, "created": time.time()}
+              "created": time.time()}
     if dry_run:
         print(f"{len(names)} candidates for {mapper} on {S.dem} ({len(site_list)} sites); {trajectories} trajectories "
               f"= {trajectories * (len(names) + 1)} runs, then about {2 * len(names) + 1} or fewer for the "
               f"collinearity test")
+        if max_trajectories > trajectories:
+            print(f"then, while some are undecided, rounds of {trajectories} more trajectories that move only those, "
+                  f"until each has {max_trajectories}: a round costs {trajectories} × (undecided + 1) runs, at most "
+                  f"{(max_trajectories - trajectories) * (len(names) + 1)} in all if every one stayed undecided")
         for k, s in specs.items():
-            rng = (f"{s.low:g} – {s.high:g}{' log' if s.log else ''}" if s.kind in ("float", "int")
-                   else "on/off" if s.kind == "bool" else "/".join(map(str, s.choices)))
-            print(f"  {k:<30} {s.kind:<6} {rng}{f'  (when {s.when})' if s.when else ''}")
+            print(f"  {k:<30} {s.kind:<6} {settings.describe_spec(s)}")
         for k, why in left_out.items():
             if not why.endswith(" only"):
                 print(f"  not screened: {k} ({why})")
@@ -551,7 +711,8 @@ def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int 
         design = morris_design(names, trajectories, seed)
         for pt in design:
             pt["params"] = params.from_unit(pt["unit"], mapper, names, specs)
-        study.run(design, workers, jobs, log)
+        study.run(design, workers, jobs, log, "screening")
+        more_trajectories(study, specs, mapper, trajectories, max_trajectories, threshold, workers, jobs, log)
     screened = complete_trajectories(study) > 0
     if not screened and not (stage == "identify" and identify):
         raise SystemExit("no complete trajectory yet: run the screening first (or name --identify parameters)")
@@ -559,6 +720,7 @@ def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int 
     if screened:
         print_screening(df, study, threshold, digits)
         df.to_csv(study_path(mapper, name, "_screening.csv"), index=False)
+        site_effects(study).to_csv(study_path(mapper, name, "_site_effects.csv"), index=False)
     res = None
     if stage in ("both", "identify"):
         if identify:
@@ -573,7 +735,7 @@ def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int 
         ref = {**{k: S.default(k, mapper) for k in [*names, *control]}, **params.load(reference, mapper)}
         pts, skipped = local_design(ref, list(dict.fromkeys([*test, *control])), all_specs, mapper, step)
         skipped = {n: why for n, why in skipped.items() if n in test and (why != "a switch or choice" or identify)}
-        study.run(pts, workers, jobs, log)
+        study.run(pts, workers, jobs, log, "collinearity")
         tested = [n for n in test if any(pt["moved"] == n for pt in pts)]
         res = identifiability(study, pts[0]["ref"], tested, gamma_crit, prefer)
         print_identifiability(res, reference or "the settings file's defaults", step, gamma_crit, skipped, digits)
@@ -584,7 +746,7 @@ def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int 
             res["table"].to_csv(study_path(mapper, name, "_identifiability.csv"), index=False)
         if res["cos"] is not None:
             res["cos"].to_csv(study_path(mapper, name, "_collinearity.csv"))
-    print_summary(df, res, threshold, complete_trajectories(study))
+    print_summary(df, res, threshold, trajectory_counts(study), trajectories)
     if study.failures():
         print(f"\nnote: {study.failures()} site runs failed and count as MCC 0 (each row's `failed` in {study.path})")
     print(f"\ntables: {study_path(mapper, name, '_*.csv')}")

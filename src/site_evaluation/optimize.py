@@ -26,12 +26,11 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
-from . import config, params, scoring, settings, sites
+from . import config, params, progress, scoring, settings, sites
 from .runner import Runner
 
 _lock = threading.Lock()
@@ -50,22 +49,48 @@ def optuna_storage(mapper: str) -> str:
     return f"sqlite:///{config.results_path(f'optuna_{mapper}.db')}"
 
 
+def suggest_number(trial, name: str, spec: settings.Spec):
+    """optuna's suggestion for a number. optuna can't step on a log scale, so a number with a step is suggested as its
+    whole count of steps, <name>_steps (on a log scale if spec.log), and multiplied back."""
+    if spec.step:
+        k = trial.suggest_int(f"{name}_steps", round(spec.low / spec.step), round(spec.high / spec.step),
+                              log=spec.log)
+        v = k * spec.step
+        return int(round(v)) if spec.kind == "int" else float(v)
+    if spec.kind == "int":
+        return trial.suggest_int(name, int(spec.low), int(spec.high), log=spec.log)
+    return trial.suggest_float(name, float(spec.low), float(spec.high), log=spec.log)
+
+
+def optuna_values(p: dict, specs: dict) -> dict:
+    """A set's values as optuna names them, for enqueue_trial (see suggest_number)."""
+    out = {}
+    for name, v in p.items():
+        s = specs.get(name)
+        if s is not None and s.step and v is not None:
+            lo, hi = round(s.low / s.step), round(s.high / s.step)
+            out[f"{name}_steps"] = int(np.clip(round(v / s.step), lo, hi))
+        else:
+            out[name] = v
+    return out
+
+
 def _suggest(trial, mapper: str, fixed: dict | None) -> dict:
     p = {}
-    for name, spec in params.space(mapper).items():
+    sp = params.space(mapper)
+    for name in settings.dependence_order({n: s.when for n, s in sp.items()}):   # what a `when` names first
+        spec = sp[name]
         if fixed and name in fixed:
             p[name] = fixed[name]
             continue
-        if spec.when and not params.switch_on(p, spec.when, mapper):
+        if spec.when and not params.active(p, spec.when, mapper):
             continue
         if spec.kind == "bool":
             p[name] = trial.suggest_categorical(name, [False, True])
         elif spec.kind == "choice":
             p[name] = trial.suggest_categorical(name, list(spec.choices))
-        elif spec.kind == "int":
-            p[name] = trial.suggest_int(name, int(spec.low), int(spec.high), log=spec.log)
         else:
-            p[name] = trial.suggest_float(name, float(spec.low), float(spec.high), log=spec.log)
+            p[name] = suggest_number(trial, name, spec)
     return p
 
 
@@ -92,9 +117,10 @@ def run_optuna(mapper: str, name: str, sampler: str = "tpe", trials: int = 1000,
                                        "settings": str(settings.current().path)})
     if enqueue and not study.trials:
         for q in enqueue:
-            study.enqueue_trial(params.searched(q, mapper), skip_if_exists=True)
-    t_start = time.time()
-    with Runner(mapper, workers) as runner:
+            study.enqueue_trial(optuna_values(params.searched(q, mapper), params.space(mapper)), skip_if_exists=True)
+    todo = trials - len([t for t in study.trials if t.state.is_finished()])
+    stopped = []
+    with Runner(mapper, workers) as runner, progress.Progress(max(todo, 0), f"optuna {name}", "trial", log) as bar:
         def objective(trial):
             p = _suggest(trial, mapper, fixed)
             t = time.time()
@@ -108,19 +134,32 @@ def run_optuna(mapper: str, name: str, sampler: str = "tpe", trials: int = 1000,
             return out["value"]
 
         def report(study, trial):
+            if stopped:
+                study.stop()                    # optuna only takes this from a callback or the objective
             if trial.value is None:
+                bar.update()
                 return
             best = study.best_trial
-            log(f"[{_stamp()}] #{trial.number} {trial.value:.4f} hold {trial.user_attrs['holdout']:.4f} "
-                f"({trial.user_attrs['wall_s']:.0f}s) | best #{best.number} {best.value:.4f} hold "
-                f"{best.user_attrs['holdout']:.4f} | {(time.time() - t_start) / 3600:.2f} h")
+            if best.number == trial.number:
+                bar.write(f"[{_stamp()}] new best: #{trial.number} {trial.value:.4f} hold "
+                          f"{trial.user_attrs['holdout']:.4f}")
+            bar.update(postfix=f"best #{best.number} {best.value:.4f} hold {best.user_attrs['holdout']:.4f}")
 
-        todo = trials - len([t for t in study.trials if t.state.is_finished()])
+        def stop():
+            stopped.append(True)
+            optuna.logging.set_verbosity(optuna.logging.ERROR)    # trials cut short by a second Ctrl-C fail
+            bar.write("Stopping: finishing the running trials (Ctrl-C again to stop now)")
+
         if todo > 0:
-            study.optimize(objective, n_trials=todo, n_jobs=jobs, callbacks=[report], catch=(RuntimeError,))
+            with progress.on_first_ctrl_c(stop):
+                study.optimize(objective, n_trials=todo, n_jobs=jobs, callbacks=[report], catch=(RuntimeError,))
     best = study.best_trial
     log(f"best #{best.number} {best.value:.4f} hold {best.user_attrs['holdout']:.4f}: "
         f"{params.describe(best.user_attrs['params_full'], mapper)}")
+    if stopped:
+        log(f"Stopped: {len([t for t in study.trials if t.state.is_finished()])} trials are saved in study {name}. "
+            "The same command continues from there.")
+        raise KeyboardInterrupt
     return best.user_attrs["params_full"]
 
 
@@ -133,10 +172,7 @@ def explore_path(mapper: str) -> Path:
 
 
 def read_explore(mapper: str) -> list[dict]:
-    path = explore_path(mapper)
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in open(path) if line.strip()]
+    return progress.read_jsonl(explore_path(mapper))
 
 
 def best_so_far(mapper: str, fixed: dict | None = None) -> dict:
@@ -155,16 +191,30 @@ class Evaluator:
     """Scores parameter sets on every site, a few sets in flight at once, and logs each to explore_<mapper>.jsonl."""
 
     def __init__(self, mapper: str, workers: int = 30, jobs: int = 3, log=print):
-        self.mapper, self.jobs, self.log = mapper, jobs, log
+        self.mapper, self.jobs, self._log = mapper, jobs, log
         self.runner = Runner(mapper, workers)
         self.t0, self.count, self.best = time.time(), 0, -1.0
+        self.bar: progress.Progress | None = None
         explore_path(mapper).parent.mkdir(parents=True, exist_ok=True)
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.runner.close()
+    def __exit__(self, exc_type, *exc):
+        if self.bar is not None:
+            self.bar.close()
+        if exc_type is KeyboardInterrupt:
+            self.log(f"Stopped: {self.count} evaluations are saved in {explore_path(self.mapper)}.")
+        self.runner.__exit__(exc_type, *exc)
+
+    def start(self, total: int | None, desc: str) -> None:
+        """The progress bar for a search of total evaluations (None: not known beforehand)."""
+        if self.bar is not None:
+            self.bar.close()
+        self.bar = progress.Progress(total, desc, "set", self._log)
+
+    def log(self, msg: str) -> None:
+        (self.bar.write if self.bar is not None else self._log)(msg)
 
     def one(self, p: dict, method: str, tag: str, extra: dict | None = None) -> dict:
         p = params.complete(p, self.mapper)
@@ -177,16 +227,18 @@ class Evaluator:
             with open(explore_path(self.mapper), "a") as f:
                 f.write(json.dumps(row, default=float) + "\n")
             self.count += 1
-            self.best = max(self.best, out["value"])
-            if self.count % 10 == 0 or out["value"] >= self.best:
-                self.log(f"[{_stamp()}] {method} {tag}: {out['value']:.4f} hold {out['holdout']:.4f} | n={self.count} "
-                         f"best {self.best:.4f} | {(time.time() - self.t0) / 3600:.2f} h")
+            if out["value"] > self.best:
+                self.best = out["value"]
+                self.log(f"[{_stamp()}] new best: {method} {tag}: {out['value']:.4f} hold {out['holdout']:.4f}")
+            if self.bar is None:
+                self.start(None, method)
+            self.bar.update(postfix=f"best {self.best:.4f}")
         return row
 
     def many(self, ps: list[dict], method: str, tags: list[str], extras: list[dict] | None = None) -> list[dict]:
         extras = extras or [None] * len(ps)
-        with ThreadPoolExecutor(self.jobs) as ex:
-            return list(ex.map(lambda a: self.one(*a), list(zip(ps, [method] * len(ps), tags, extras))))
+        return progress.thread_map(lambda a: self.one(*a), list(zip(ps, [method] * len(ps), tags, extras)), self.jobs,
+                                   self.log)
 
 
 def continuous_names(mapper: str, base: dict, fixed: dict) -> list[str]:
@@ -196,7 +248,7 @@ def continuous_names(mapper: str, base: dict, fixed: dict) -> list[str]:
     for name, spec in params.space(mapper).items():
         if spec.kind not in ("float", "int") or name in fixed:
             continue
-        if spec.when and not params.switch_on(base, spec.when, mapper):
+        if spec.when and not params.active(base, spec.when, mapper):
             continue
         names.append(name)
     if not names:
@@ -224,6 +276,7 @@ def sobol(ev: Evaluator, n: int = 1024, seed: int = 0) -> None:
     done = {r["tag"] for r in read_explore(ev.mapper) if r["method"] == "sobol"}
     pts = qmc.Sobol(len(names), scramble=True, seed=seed).random(n)
     todo = [(i, u) for i, u in enumerate(pts) if f"sobol{seed}_{i}" not in done]
+    ev.start(len(todo), f"sobol{seed}")
     ev.many([params.from_unit(u, ev.mapper, names) for _, u in todo], "sobol", [f"sobol{seed}_{i}" for i, _ in todo])
 
 
@@ -236,6 +289,7 @@ def cma(ev: Evaluator, tag: str, budget: int = 600, popsize: int = 12, sigma: fl
     lo, hi = _unit_bounds(ev.mapper, names, bounds or {})
     x = np.clip(params.to_unit(base, ev.mapper, names), lo, hi)
     ev.log(f"CMA-ES over {names} from {np.round(x, 3)}")
+    ev.start(budget, f"cma {tag}")
     es = pycma.CMAEvolutionStrategy(x, sigma, {"bounds": [list(lo), list(hi)], "popsize": popsize, "seed": seed + 1,
                                                "maxfevals": budget, "verbose": -9})
     gen = 0
@@ -259,6 +313,7 @@ def coord(ev: Evaluator, tag: str, step: float = 0.1, min_step: float = 0.012, m
         return {**base, **params.from_unit(u, ev.mapper, names)}
 
     x = np.clip(params.to_unit(base, ev.mapper, names), lo, hi)
+    ev.start(None, f"coord {tag}")
     cur = ev.one(at(x), "coord", f"{tag}_start")["value"]
     it = 0
     while step >= min_step and it < max_iter:
@@ -290,7 +345,6 @@ def profile(ev: Evaluator, tag: str, points: int = 13, x0: dict | None = None, o
     for name, spec in params.space(ev.mapper).items():
         if only and name not in only:
             continue
-        cond = spec.when
         if spec.kind == "bool":
             vals = [False, True]
         elif spec.kind == "choice":
@@ -299,11 +353,13 @@ def profile(ev: Evaluator, tag: str, points: int = 13, x0: dict | None = None, o
             vals = sorted({params.from_unit([u], ev.mapper, [name])[name] for u in np.linspace(0, 1, points)})
         for v in vals:
             q = {**base, name: v}
-            if cond:
-                q[cond] = True
+            for c, need in settings.conditions(spec.when):     # what it depends on, set so that it is used
+                if c != settings.DEM_KEY and not params.active(q, {c: need}, ev.mapper):
+                    q[c] = need[0]
             ps.append(q)
             tags.append(f"{tag}_{name}={v}")
             extras.append({"profile_param": name, "profile_value": v})
+    ev.start(len(ps), f"profile {tag}")
     ev.many(ps, "profile", tags, extras)
 
 
@@ -318,6 +374,7 @@ def switches(ev: Evaluator, tag: str, bases: list[dict] | None = None) -> None:
             if spec.kind == "bool":
                 ps.append({**base, name: not base[name]})
                 tags.append(f"{tag}_b{b}_{name}={not base[name]}")
+    ev.start(len(ps), f"switches {tag}")
     ev.many(ps, "switches", tags)
 
 
@@ -344,14 +401,7 @@ def apply_reduced(base: dict, r: dict, reduced: dict) -> dict:
 
 
 def _reduced_from_unit(u, names, reduced):
-    r = {}
-    for x, n in zip(u, names):
-        sp = reduced[n]["spec"]
-        x = float(np.clip(x, 0, 1))
-        lo, hi = sp.low, sp.high
-        v = np.exp(np.log(lo) + x * (np.log(hi) - np.log(lo))) if sp.log else lo + x * (hi - lo)
-        r[n] = int(round(v)) if sp.kind == "int" else float(v)
-    return r
+    return {n: params.value_at(x, reduced[n]["spec"]) for x, n in zip(u, names)}
 
 
 def _reduced_to_unit(r, names, reduced):
@@ -400,14 +450,11 @@ class SiteSearch:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         st = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(
             multivariate=True, n_startup_trials=startup, seed=seed))
-        st.enqueue_trial(reduced_identity(self.base, self.names, self.reduced))
+        specs = {n: self.reduced[n]["spec"] for n in self.names}
+        st.enqueue_trial(optuna_values(reduced_identity(self.base, self.names, self.reduced), specs))
         for _ in range(budget):
             t = st.ask()
-            r = {}
-            for n in self.names:
-                sp = self.reduced[n]["spec"]
-                r[n] = (t.suggest_int(n, int(sp.low), int(sp.high), log=sp.log) if sp.kind == "int"
-                        else t.suggest_float(n, float(sp.low), float(sp.high), log=sp.log))
+            r = {n: suggest_number(t, n, specs[n]) for n in self.names}
             st.tell(t, self.score(r, "tpe"))
         return st.best_value
 
@@ -450,16 +497,14 @@ def run_persite(mapper: str, base: dict, run: str, site_list: list[str], names: 
     persite_path(mapper, run).parent.mkdir(parents=True, exist_ok=True)
     meta = config.results_path(f"persite_{mapper}_{run}.base.json")
     meta.write_text(json.dumps({"base": base, "names": names}, indent=1, default=float))
-    t0 = time.time()
-    with Runner(mapper, workers) as runner:
+    jobs = [(s, m) for s in site_list for m in searches]
+    with Runner(mapper, workers) as runner, progress.Progress(len(jobs), f"persite {run}", "search", log) as bar:
         def job(item):
             site, search = item
             ss = SiteSearch(runner, site, base, names, run, reduced)
             v = ss.tpe(budget, startup, seed) if search == "tpe" else ss.own(n_sobol, seed)
-            log(f"[{_stamp()}] {search:<4} {site:<66} best {v:.4f} ({len(ss.cache)} evaluations) | "
-                f"{(time.time() - t0) / 3600:.2f} h")
+            bar.write(f"[{_stamp()}] {search:<4} {site:<66} best {v:.4f} ({len(ss.cache)} evaluations)")
+            bar.update()
 
-        jobs = [(s, m) for s in site_list for m in searches]
         # each search has one evaluation in flight at a time, so keep enough searches going to fill the pool
-        with ThreadPoolExecutor(min(len(jobs), 3 * workers)) as ex:
-            list(ex.map(job, jobs))
+        progress.thread_map(job, jobs, 3 * workers, bar.write, finish_running=False)

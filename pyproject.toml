@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 # nencarta, arc and curve2flood come from their repos (editable installs), GDAL from conda
 dependencies = [
-    "numpy", "pandas", "matplotlib", "scipy", "scikit-learn", "optuna", "cma", "geopandas", "pyarrow",
+    "numpy", "pandas", "matplotlib", "scipy", "scikit-learn", "optuna", "cma", "geopandas", "pyarrow", "tqdm",
 ]
 
 [project.scripts]
