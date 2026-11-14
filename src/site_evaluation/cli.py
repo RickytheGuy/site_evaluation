@@ -118,7 +118,7 @@ def cmd_optimize(a):
     if a.method == "optuna":
         enqueue = [params.complete(_load_params(s, a.mapper), a.mapper) for s in (a.enqueue or [])]
         optimize.run_optuna(a.mapper, a.name, a.sampler, a.trials, a.jobs, a.workers, a.startup, a.seed, fixed,
-                            enqueue)
+                            enqueue, patience=a.patience, min_gain=a.min_gain)
         return
     if a.method == "persite":
         base = params.complete(_load_params(a.base, a.mapper), a.mapper)
@@ -380,6 +380,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--trials", type=int, default=1000)
     q.add_argument("--jobs", type=int, default=3, help="parameter sets in flight")
     q.add_argument("--startup", type=int, default=50)
+    q.add_argument("--patience", type=int, default=200,
+                   help="stop once the best has risen less than --min-gain over this many trials (default 200; 0: "
+                        "never)")
+    q.add_argument("--min-gain", type=float, default=0.01, help="the least rise in MCC that counts (default 0.01)")
     q.add_argument("--fixed", help="JSON dict (or file) of parameters held fixed")
     q.add_argument("--enqueue", nargs="*", help="parameter sets to try first")
     q = opt("sobol", "a scrambled Sobol screen of the whole space")

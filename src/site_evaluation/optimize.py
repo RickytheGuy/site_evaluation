@@ -94,12 +94,33 @@ def _suggest(trial, mapper: str, fixed: dict | None) -> dict:
     return p
 
 
+def recent_gain(study, window: int) -> float | None:
+    """How much the best score rose over the study's last `window` finished trials (None until it has more)."""
+    import optuna
+    done = sorted(study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)), key=lambda t: t.number)
+    if window <= 0 or len(done) <= window:
+        return None
+    return max(t.value for t in done) - max(t.value for t in done[:-window])
+
+
+def stalled(gain: float | None, min_gain: float) -> bool:
+    """A study stops when the best rose by less than min_gain over the window (by nothing at all if min_gain is 0)."""
+    return gain is not None and (gain <= 0 or gain < min_gain - 1e-9)
+
+
 def run_optuna(mapper: str, name: str, sampler: str = "tpe", trials: int = 1000, jobs: int = 3, workers: int = 30,
                startup: int = 50, seed: int = 0, fixed: dict | None = None, enqueue: list[dict] | None = None,
-               log=print) -> dict:
-    """A global optuna study (resumed if it exists). Returns the best trial's parameters."""
+               patience: int = 200, min_gain: float = 0.01, log=print) -> dict:
+    """A global optuna study (resumed if it exists). Returns the best trial's parameters.
+
+    It stops early, like optuna's terminator with a stagnation evaluator, once the best calibration score has risen by
+    less than min_gain over the last `patience` finished trials (patience 0: never). optuna's own
+    BestValueStagnationEvaluator counts any rise, and TPE keeps finding rises of 0.001, so it would rarely stop."""
+    import warnings
+
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)    # TPE's group
     samplers = {
         "tpe": lambda: optuna.samplers.TPESampler(multivariate=True, group=True, constant_liar=True,
                                                   n_startup_trials=startup, seed=seed),
@@ -119,7 +140,15 @@ def run_optuna(mapper: str, name: str, sampler: str = "tpe", trials: int = 1000,
         for q in enqueue:
             study.enqueue_trial(optuna_values(params.searched(q, mapper), params.space(mapper)), skip_if_exists=True)
     todo = trials - len([t for t in study.trials if t.state.is_finished()])
-    stopped = []
+    stopped, settled = [], []
+
+    def why(gain: float) -> str:
+        return f"the best rose {gain:.3f} over the last {patience} trials, under --min-gain {min_gain}"
+
+    gain = recent_gain(study, patience)
+    if todo > 0 and stalled(gain, min_gain):
+        log(f"Study {name} has stopped improving: {why(gain)}. A larger --patience (0: none) continues it.")
+        todo = 0
     with Runner(mapper, workers) as runner, progress.Progress(max(todo, 0), f"optuna {name}", "trial", log) as bar:
         def objective(trial):
             p = _suggest(trial, mapper, fixed)
@@ -143,7 +172,13 @@ def run_optuna(mapper: str, name: str, sampler: str = "tpe", trials: int = 1000,
             if best.number == trial.number:
                 bar.write(f"[{_stamp()}] new best: #{trial.number} {trial.value:.4f} hold "
                           f"{trial.user_attrs['holdout']:.4f}")
-            bar.update(postfix=f"best #{best.number} {best.value:.4f} hold {best.user_attrs['holdout']:.4f}")
+            gain = recent_gain(study, patience)
+            if stalled(gain, min_gain) and not settled:
+                settled.append(why(gain))
+                bar.write(f"[{_stamp()}] Stopping: {settled[0]} (finishing the running trials)")
+                study.stop()
+            bar.update(postfix=f"best #{best.number} {best.value:.4f} hold {best.user_attrs['holdout']:.4f}"
+                               + ("" if gain is None else f", last {patience} +{gain:.3f}"))
 
         def stop():
             stopped.append(True)
@@ -156,6 +191,9 @@ def run_optuna(mapper: str, name: str, sampler: str = "tpe", trials: int = 1000,
     best = study.best_trial
     log(f"best #{best.number} {best.value:.4f} hold {best.user_attrs['holdout']:.4f}: "
         f"{params.describe(best.user_attrs['params_full'], mapper)}")
+    if settled and not stopped:
+        log(f"Stopped early after {len([t for t in study.trials if t.state.is_finished()])} trials: {settled[0]}. "
+            "A larger --patience (0: none) continues it.")
     if stopped:
         log(f"Stopped: {len([t for t in study.trials if t.state.is_finished()])} trials are saved in study {name}. "
             "The same command continues from there.")

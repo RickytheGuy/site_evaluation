@@ -115,11 +115,14 @@ site-eval show space --mapper fldpln             # every searched argument and i
 site-eval optimize optuna --mapper fldpln --name tpe_1 --trials 1000
 ```
 
-optuna's TPE sampler searches every `optimize: true` argument over its range.
+optuna's TPE sampler searches every `optimize: true` argument over its range. It models the arguments jointly
+(`multivariate`), and `group` keeps that working when a `when` switches some of them off.
 - It maximizes the calibration sites' mean MCC.
 - It scores the hold-out sites on every trial, but never optimizes on them.
+- It stops early once the best has risen by less than 0.01 over the last 200 trials (`--min-gain`, `--patience`;
+  `--patience 0` never stops early).
 - Trials go to `optuna_fldpln.db` in the results folder.
-- The same `--name` resumes the study.
+- The same `--name` resumes the study. One that stopped early continues only with a larger `--patience`.
 
 [Optimize](#optimize) lists the other searches.
 
@@ -144,7 +147,8 @@ site-eval plot site Wabash_River_at_Lafayette --mapper fldpln --tag best   # map
 ```
 
 - Judge a set by its hold-out mean as well as its calibration mean. A gain under 0.01 MCC is no gain.
-- If the convergence plot is still climbing, run more trials: the same `--name` with a larger `--trials`.
+- If the convergence plot is still climbing, run more trials: the same `--name` with a larger `--trials` (and a
+  larger `--patience` if it stopped early).
 - If the landscape is flat for a parameter, you can fix it too.
 - To adopt the result, copy its values into `settings.yaml` as the new defaults (`value`).
 
