@@ -13,8 +13,9 @@ site-eval: run, score and calibrate flood maps on the FIM benchmark sites, and l
                                                               can be calibrated together (collinearity index)
     site-eval attributes --mapper fldpln                      ARC's reach attributes of every site (runs each once)
 
-Every model argument, its default and whether it is searched (and over what) are in the settings file,
-settings.yaml (--settings for another). Parameter sets (--params) override its values: a JSON file, a JSON string
+Every command names its settings file with --settings FILE (or -s FILE), before or after the command; there is no
+default. The file gives every model argument, its default and whether it is searched (and over what), the DEM, and
+the results folder. Parameter sets (--params) override its values: a JSON file, a JSON string
 or a preset (G_plaus_fldpln, G_plaus_kernel, reference), naming arguments as the file does. Sites (--sites) are name fragments, or calib / holdout / all.
 Scores print at 2 decimals (--digits to change): a change under 0.01 MCC is no change.
 """
@@ -251,7 +252,7 @@ def cmd_show(a):
         print(f"{S.path}: DEM {S.dem}, cell size {S.cell_size}"
               + (f" ({S.nominal_cell_size[S.dem]} m)" if S.cell_size == "nominal" else "")
               + f"; {len(S.space(a.mapper))} parameters searched for {a.mapper}; fixed-settings fingerprint "
-              + S.fingerprint(a.mapper))
+              + S.fingerprint(a.mapper) + f"; results in {config.results_root()}")
 
 
 def cmd_sensitivity(a):
@@ -324,16 +325,20 @@ def cmd_plot(a):
 # argument parsing
 # --------------------------------------------------------------------------------------------------------------------
 
+SETTINGS_HELP = "the settings file (required, before or after the command): model arguments, DEM, results folder"
+RESULTS_HELP = "a results folder instead of the settings file's, for this command"
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="site-eval", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results", default=None, help=f"results folder (default {config.RESULTS_ROOT})")
-    ap.add_argument("--settings", default=None, help="settings file (default: $SITE_EVAL_SETTINGS or the package's "
-                                                     "settings.yaml)")
+    ap.add_argument("--settings", "-s", default=None, help=SETTINGS_HELP)
+    ap.add_argument("--results", default=None, help=RESULTS_HELP)
     sub = ap.add_subparsers(dest="command", required=True)
     mappers = list(config.MAPPERS)
 
     def common(p, mapper_required=True, digits=True):
+        p.add_argument("--settings", "-s", default=argparse.SUPPRESS, help=SETTINGS_HELP)   # also after the command
+        p.add_argument("--results", default=argparse.SUPPRESS, help=RESULTS_HELP)
         if mapper_required:
             p.add_argument("--mapper", "-m", choices=mappers, required=True)
         else:
@@ -349,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="run and score one parameter set")
     common(p)
-    p.add_argument("--params", help="preset, JSON file or JSON string (default: the mapper's G_plaus set)")
+    p.add_argument("--params", help="preset, JSON file or JSON string (default: the settings file's defaults)")
     p.add_argument("--sites", nargs="*")
     p.add_argument("--stages", default="all", help="'all' (default) or k stages per site, evenly spread")
     p.add_argument("--workers", type=int, default=30)
@@ -491,9 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    a = build_parser().parse_args(argv)
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    if not a.settings:
+        ap.error("--settings FILE is required (the model arguments, the DEM and the results folder), for example "
+                 "site-eval --settings ~/site_evaluation/settings.yaml " + (a.command or "..."))
     if a.results:
-        config.RESULTS_ROOT = Path(a.results).expanduser().resolve()
+        config.RESULTS_OVERRIDE = Path(a.results).expanduser().resolve()
     from . import settings
     try:
         settings.use(a.settings)

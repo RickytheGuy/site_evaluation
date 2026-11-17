@@ -205,7 +205,7 @@ def best_in_range(df: pd.DataFrame) -> tuple[pd.Series, float]:
 
 def persite_runs(mapper: str) -> list[str]:
     prefix = f"persite_{mapper}_"
-    return sorted(p.name[len(prefix):-len(".jsonl")] for p in config.RESULTS_ROOT.glob(f"{prefix}*.jsonl"))
+    return sorted(p.name[len(prefix):-len(".jsonl")] for p in config.results_root().glob(f"{prefix}*.jsonl"))
 
 
 def persite_frame(mapper: str, run: str) -> pd.DataFrame:

@@ -1,9 +1,9 @@
 """
 Where the data lives. Every model setting is in the settings file (settings.yaml, see settings.py).
 
-Each path can be overridden with an environment variable (SITE_EVAL_SITES, SITE_EVAL_CACHE, SITE_EVAL_WORK,
-SITE_EVAL_RESULTS). The results folder can also be set per command with ``site-eval --results DIR``. Code reads these
-module attributes when it runs, so setting them at runtime works.
+The sites, cache and working copies can be moved with an environment variable (SITE_EVAL_SITES, SITE_EVAL_CACHE,
+SITE_EVAL_WORK). The results folder is the settings file's (its top-level `results`); ``site-eval --results DIR``
+replaces it for one command. Code reads these when it runs, so setting them at runtime works.
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ SITES_ROOT = _env_path("SITE_EVAL_SITES", "~/fim_sites")
 CACHE_ROOT = _env_path("SITE_EVAL_CACHE", "~/fim_sites_nencarta_v3")
 #: Each worker's own copy of the cache
 WORK_ROOT = _env_path("SITE_EVAL_WORK", "~/fim_sites_nencarta_v3_work")
-#: The evaluation archives, optimization studies, kept maps, site tables and figures
-RESULTS_ROOT = _env_path("SITE_EVAL_RESULTS", "~/site_evaluation/results")
+#: A results folder that replaces the settings file's (site-eval --results); None: the settings file's
+RESULTS_OVERRIDE: Path | None = None
 
 MAPPERS = {"fldpln": "Curve2Flood-FLDPLNpy", "kernel": "Curve2Flood-Kernel Weighted"}
 
@@ -60,6 +60,13 @@ def bathyflow_field(arc: dict) -> str:
     return "bankfull" if arc.get("Bathy_Use_Banks") else "baseflow"
 
 
+def results_root() -> Path:
+    """The evaluation archives, optimization studies, screening studies, kept maps, site tables and figures: the
+    settings file's results folder, unless --results replaces it."""
+    from . import settings
+    return RESULTS_OVERRIDE or settings.current().results
+
+
 def results_path(*parts: str) -> Path:
     """A path under the current results folder (not created)."""
-    return RESULTS_ROOT.joinpath(*parts)
+    return results_root().joinpath(*parts)

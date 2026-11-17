@@ -38,12 +38,23 @@
 # A parameter set (--params, the optimizers' trials, the archive) names arguments as written here. An argument whose
 # name appears in two sections is named <section>.<name>, for example curve2flood.compression.
 #
+# Every site-eval command names its settings file: site-eval --settings FILE ... (or -s FILE, before or after the
+# command). There is no default file.
+#
 # After changing anything under `nencarta` or `dem`, rebuild the cached preprocessing: site-eval prepare --mapper M.
 # Runs refuse a cache that was built with other nencarta settings.
 #
 # Comments show each tool's documentation (ARC: docs/model_input_file.md, curve2flood: docs/input_file.md, nencarta:
 # nencarta/core/defaults.py, FLDPLN library: curve2flood.build_fldpln_library).
 # =====================================================================================================================
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Where this file's results go: the run archive, the optuna and screening studies, kept maps, site tables and figures.
+# Give each settings file its own folder (another DEM: change dem.name and this together). The archive and the
+# optuna database don't keep DEMs apart, and `show` and `plot` pool every run and study in the folder. ~ is expanded;
+# a relative path is taken from this file's folder. site-eval --results DIR replaces it for one command.
+# ---------------------------------------------------------------------------------------------------------------------
+results: ~/site_evaluation/results
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The DEM, and the cell size the metre-based stand-ins are converted with
@@ -89,7 +100,7 @@ derived:
   # Depth-varying n: n(h) = n × (1 + (dvn_shallow − 1) / (1 + k h)), with dvn_L = (dvn_shallow − 1) / k the depth
   # scale (m). On: Depth_Varying_N true, shallow_factor = dvn_shallow, deep_factor 1, k_decay = (dvn_shallow − 1) / dvn_L.
   # Off: Depth_Varying_N false (and the other three left out).
-  dvn:             {value: false, optimize: true}
+  dvn:             {value: false, optimize: false}
   dvn_shallow:     {value: 2.0, optimize: true, range: [1.0, 10.0], log: true, when: dvn}
   dvn_L:           {value: 0.2, optimize: true, range: [0.02, 2.0], log: true, when: dvn}
 
@@ -241,7 +252,7 @@ arc:
   # Overbanks from lines square to the valley, at the valley's slope (kept fixed, Ricky).
   Valley_Sections: {value: true, optimize: true}
   Valley_Dir_Widths: {value: 16.0, optimize: false, range: [4.0, 40.0], when: Valley_Sections}   # channel widths each way for the valley's direction
-  Valley_Dir_Dist: {value: 40, optimize: false, range: [2, 120], when: Valley_Sections}           # cells each way, where a reach has no width
+  Valley_Dir_Dist: {value: {usgs: 120, other: 40}, optimize: false, range: [2, 120], when: Valley_Sections}           # cells each way, where a reach has no width
   Subcell_Channels: {value: false, optimize: false}   # rebuild channels under 10 cells across below the cell scale
   Drop_Edge_Sections: {value: true, optimize: false}    # drop cross sections whose water reaches the raster's edge
   Edge_Margin: {value: 0.0, optimize: false, range: [0.0, 500.0], when: Drop_Edge_Sections}   # metres
@@ -262,7 +273,7 @@ arc:
   # --- Bathymetry ---
   # true: the banks are the bank tops and the bankfull flow fills the channel to them; false: the DEM's water surface
   # carries the baseflow. Sets nencarta's specified_bathyflow_field (bankfull or baseflow). true (Ricky).
-  Bathy_Use_Banks: {value: true, optimize: false}
+  Bathy_Use_Banks: {value: true, optimize: true}
   Bathy_Trap_H: {value: {fldpln: 0.0, kernel: 0.43875476549804865}, optimize: true, range: [0.0, 0.5]}   # trapezoid side share of the top width
   Bathy_Smooth_Banks: {value: true, optimize: true}     # smooth each reach's channel widths and bank elevations
   Bathy_Smooth_Bed: {value: null, choices: [true, false], optimize: false}   # null: ARC decides (off with Standard_Step or Bathy_Use_Banks)
@@ -298,7 +309,7 @@ curve2flood:
   Make_Output_GPKG: {value: false}                # also write the flood extent as polygons
   compression: {value: None}                      # the maps' compression (default LZW)
   # Always flood the stream cells and the land cover's water cells (on since 2026-11-11: +0.004 FLDPLN, +0.002 kernel).
-  Flood_WaterLC_and_STRM_Cells: {value: true, optimize: true}
+  Flood_WaterLC_and_STRM_Cells: {value: true, optimize: false}
   Flood_Bathy_Mask: {value: true, optimize: false}    # always flood the water mask's cells
 
   # --- Kernel-weighted mapper ---

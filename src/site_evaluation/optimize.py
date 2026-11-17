@@ -45,7 +45,7 @@ def _stamp() -> str:
 # --------------------------------------------------------------------------------------------------------------------
 
 def optuna_storage(mapper: str) -> str:
-    config.RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+    config.results_root().mkdir(parents=True, exist_ok=True)
     return f"sqlite:///{config.results_path(f'optuna_{mapper}.db')}"
 
 

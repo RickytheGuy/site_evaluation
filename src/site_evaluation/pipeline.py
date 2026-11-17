@@ -36,7 +36,6 @@ def worker_environment() -> None:
                 "ARROW_IO_THREADS", "OMP_THREAD_LIMIT"):
         os.environ[var] = "1"
     os.environ.setdefault("PYTHONHASHSEED", "0")
-    os.environ["SITE_EVAL_SETTINGS"] = str(settings.current().path)
 
 
 def watershed_dict(site: str, p: dict, mapper: str, output_dir: Path, n_file: str | None,

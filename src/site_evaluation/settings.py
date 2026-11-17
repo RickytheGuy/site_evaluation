@@ -2,7 +2,9 @@
 The settings file (settings.yaml): every argument a run sets in nencarta, ARC, curve2flood and the FLDPLN library,
 its default, and whether and over what the optimizers search it. Its header documents the format.
 
-    S = settings.current()                 # the file in use (SITE_EVAL_SETTINGS, --settings, or the package's)
+    settings.use("settings.yaml")         # required first (the command line's --settings)
+    S = settings.current()                 # the file in use
+    S.results                              # its results folder
     S.space("fldpln")                      # the search space: {name: Spec}
     S.defaults("fldpln")                   # the default value of every searched parameter
     S.model_args(p, "fldpln", site)        # nencarta's options, arc_args, curve2flood_args, fldpln_library_args
@@ -20,9 +22,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
-
-#: The settings file used when neither SITE_EVAL_SETTINGS nor --settings names another
-DEFAULT_PATH = Path(__file__).resolve().parents[2] / "settings.yaml"
 
 SECTIONS = ("mannings_n", "derived", "nencarta", "arc", "curve2flood", "fldpln_library")
 #: Where each tool-argument section goes in nencarta's configuration
@@ -143,6 +142,7 @@ class Settings:
     nominal_cell_size: dict
     entries: dict[str, Entry]       # by key, in file order
     persite_raw: dict
+    results: Path                   # the results folder the file names
 
     # ----------------------------------------------------------------------------------------------------------------
     # Values
@@ -533,15 +533,23 @@ def _check_entry(where: str, raw, allowed: set) -> dict:
     return raw
 
 
-def load(path: str | os.PathLike | None = None) -> Settings:
+def load(path: str | os.PathLike) -> Settings:
     """Read and check a settings file."""
     import yaml
-    path = Path(path or os.environ.get("SITE_EVAL_SETTINGS") or DEFAULT_PATH).expanduser().resolve()
+    if not path:
+        raise SettingsError("no settings file given")
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise SettingsError(f"no settings file {path}")
     text = path.read_text()
     data = yaml.safe_load(text) or {}
-    unknown = set(data) - {*SECTIONS, "dem", "persite"}
+    unknown = set(data) - {*SECTIONS, "dem", "persite", "results"}
     if unknown:
         raise SettingsError(f"{path}: unknown section(s) {sorted(unknown)}")
+    if not isinstance(data.get("results"), str) or not data["results"].strip():
+        raise SettingsError(f"{path}: no results folder: add  results: <folder>  at the top level")
+    results = Path(data["results"].strip()).expanduser()
+    results = (results if results.is_absolute() else path.parent / results).resolve()   # relative: to the file
     dem = data.get("dem") or {}
     nominal = dict(dem.get("nominal_cell_size_m") or {})
     name = dem.get("name", "fabdem")
@@ -561,7 +569,8 @@ def load(path: str | os.PathLike | None = None) -> Settings:
             raw = _check_entry(f"{sec}.{n}", raw, ENTRY_FIELDS)
             key = f"{sec}.{n}" if counts[n.lower()] > 1 else n
             entries[key] = Entry(sec, n, key, raw)
-    s = Settings(path, text, name, dem.get("cell_size", "nominal"), nominal, entries, data.get("persite") or {})
+    s = Settings(path, text, name, dem.get("cell_size", "nominal"), nominal, entries, data.get("persite") or {},
+                 results)
     _validate(s)
     return s
 
@@ -643,16 +652,15 @@ def _validate(s: Settings) -> None:
 _CURRENT: Settings | None = None
 
 
-def use(path: str | os.PathLike | None) -> Settings:
-    """Make a settings file the current one (also for worker processes started afterwards)."""
+def use(path: str | os.PathLike) -> Settings:
+    """Make a settings file the current one. Worker processes are handed its path and call this themselves."""
     global _CURRENT
     _CURRENT = load(path)
-    os.environ["SITE_EVAL_SETTINGS"] = str(_CURRENT.path)
     return _CURRENT
 
 
 def current() -> Settings:
-    global _CURRENT
+    """The settings file in use: settings.use(path) names it (the command line's --settings); there is no default."""
     if _CURRENT is None:
-        _CURRENT = load()
+        raise SettingsError("no settings file in use: pass --settings FILE (from Python: settings.use(path))")
     return _CURRENT

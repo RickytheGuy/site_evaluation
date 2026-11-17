@@ -21,30 +21,34 @@ The examples use FLDPLN.
 
 ```bash
 source ~/miniforge3/etc/profile.d/conda.sh && conda activate flood
-export SITE_EVAL_RESULTS=~/site_evaluation/results/fabdem_v1   # a new results folder for this calibration
+cd ~/site_evaluation
 ```
 
-Give each calibration its own results folder. The commands in step 6 pool every study in the folder they read.
+Every command names its settings file with `--settings FILE` (or `-s FILE`, before or after the command); there is
+no default. The settings file also names the results folder (`results:` at its top). Give each calibration its own
+settings file and results folder, because the commands in step 6 pool every study in the folder they read. The
+examples use `settings.yaml` (FABDEM); `settings_usgs.yaml` is the same file for USGS 3DEP.
 
 ### 1. Set up the settings
 
 Edit [`settings.yaml`](settings.yaml). [The settings file](#the-settings-file) below explains its format.
-- `dem.name`: the DEM.
+- `dem.name`: the DEM, and `results`: the results folder. For another DEM or a fresh calibration, copy the file and
+  change both.
 - Each argument's `value` (its default), and its `range` (its physically plausible values) or `choices`. Step 3's
   collinearity test is done at the defaults, so make them your best current set.
 - `screen: false` on anything you fix beforehand on physical grounds, with a comment saying why.
 
 ```bash
-site-eval show settings --mapper fldpln          # every argument as the file gives it
-site-eval prepare --mapper fldpln                # build the cache (again after any change under nencarta or dem)
-site-eval run --mapper fldpln --tag defaults     # the score to beat
+site-eval -s settings.yaml show settings --mapper fldpln          # every argument as the file gives it
+site-eval -s settings.yaml prepare --mapper fldpln                # build the cache (again after any change under nencarta or dem)
+site-eval -s settings.yaml run --mapper fldpln --tag defaults     # the score to beat
 ```
 
 ### 2. Run the sensitivity study
 
 ```bash
-site-eval sensitivity --mapper fldpln --dry-run  # the candidates and how many runs they take
-site-eval sensitivity --mapper fldpln            # about 3 h for FLDPLN on 30 workers (10 s a run), then rounds
+site-eval -s settings.yaml sensitivity --mapper fldpln --dry-run  # the candidates and how many runs they take
+site-eval -s settings.yaml sensitivity --mapper fldpln            # about 3 h for FLDPLN on 30 workers (10 s a run), then rounds
 ```
 
 It screens every candidate on the calibration sites, then tests the influential ones for collinearity. A candidate is
@@ -64,8 +68,8 @@ and continue later:
 ### 3. Read the sensitivity results
 
 ```bash
-site-eval sensitivity --mapper fldpln            # prints the report again (nothing is rerun)
-site-eval plot sensitivity --mapper fldpln       # each parameter's μ* and interval; how alike their effects are
+site-eval -s settings.yaml sensitivity --mapper fldpln            # prints the report again (nothing is rerun)
+site-eval -s settings.yaml plot sensitivity --mapper fldpln       # each parameter's μ* and interval; how alike their effects are
 ```
 
 The report has two tables and ends with a **Suggested** list.
@@ -75,7 +79,7 @@ The report has two tables and ends with a **Suggested** list.
   0.01 or more (up/down). The two 95% intervals give the class:
   - **influential**: μ\*'s interval lies above 0.01 MCC. The parameter matters.
   - **undecided**: μ\*'s interval straddles 0.01. The study has already run rounds of more trajectories for it, up
-    to `--max-trajectories`. To run another round: `site-eval sensitivity --mapper fldpln --max-trajectories 80`.
+    to `--max-trajectories`. To run another round: `site-eval -s settings.yaml sensitivity --mapper fldpln --max-trajectories 80`.
   - **trades sites**: μ\*'s interval lies below 0.01 but site μ\*'s lies above it. The mean doesn't move, but sites
     do, both ways: its value picks which sites do well. `fldpln_fabdem_site_effects.csv` gives each site's change.
   - **undecided (sites)**: μ\*'s interval lies below 0.01 and site μ\*'s straddles it. Also gets rounds.
@@ -86,7 +90,7 @@ The report has two tables and ends with a **Suggested** list.
     trade one against the other.
   - The report names the combinations that compensate each other.
 - If the slope factor and the n values compete, keep the n values. This reruns only the identifiability part:
-  `site-eval sensitivity --mapper fldpln --stage identify --prefer n_tree n_water`.
+  `site-eval -s settings.yaml sensitivity --mapper fldpln --stage identify --prefer n_tree n_water`.
 
 The tables are also saved as `sensitivity/fldpln_fabdem_*.csv` in the results folder.
 [Choose what to calibrate](#choose-what-to-calibrate) explains the method and gives its references.
@@ -106,13 +110,13 @@ Give the reason in each line's comment, for example `# negligible: μ* 0.00 (scr
 what will be searched:
 
 ```bash
-site-eval show space --mapper fldpln             # every searched argument and its range
+site-eval -s settings.yaml show space --mapper fldpln             # every searched argument and its range
 ```
 
 ### 5. Optimize
 
 ```bash
-site-eval optimize optuna --mapper fldpln --name tpe_1 --trials 1000
+site-eval -s settings.yaml optimize optuna --mapper fldpln --name tpe_1 --trials 1000
 ```
 
 optuna's TPE sampler searches every `optimize: true` argument over its range. It models the arguments jointly
@@ -129,21 +133,21 @@ optuna's TPE sampler searches every `optimize: true` argument over its range. It
 ### 6. Read the optimization results
 
 ```bash
-site-eval show studies --mapper fldpln           # progress: the best after 50, 100, ... trials
-site-eval plot convergence --mapper fldpln
-site-eval show top --mapper fldpln --in-range    # the best sets, with calibration and hold-out scores
-site-eval show importance --mapper fldpln        # which parameters the score depends on
-site-eval plot landscape --mapper fldpln         # the score against each parameter
-site-eval show best --mapper fldpln --save best_fldpln.json
+site-eval -s settings.yaml show studies --mapper fldpln           # progress: the best after 50, 100, ... trials
+site-eval -s settings.yaml plot convergence --mapper fldpln
+site-eval -s settings.yaml show top --mapper fldpln --in-range    # the best sets, with calibration and hold-out scores
+site-eval -s settings.yaml show importance --mapper fldpln        # which parameters the score depends on
+site-eval -s settings.yaml plot landscape --mapper fldpln         # the score against each parameter
+site-eval -s settings.yaml show best --mapper fldpln --save best_fldpln.json
 ```
 
 Then run the best set and compare it with the defaults, site by site:
 
 ```bash
-site-eval run --mapper fldpln --params best_fldpln.json --tag best --keep
-site-eval show run best --mapper fldpln          # per site: score, bias, recall, precision
-site-eval plot compare defaults best --mapper fldpln
-site-eval plot site Wabash_River_at_Lafayette --mapper fldpln --tag best   # maps: hits, false alarms, misses
+site-eval -s settings.yaml run --mapper fldpln --params best_fldpln.json --tag best --keep
+site-eval -s settings.yaml show run best --mapper fldpln          # per site: score, bias, recall, precision
+site-eval -s settings.yaml plot compare defaults best --mapper fldpln
+site-eval -s settings.yaml plot site Wabash_River_at_Lafayette --mapper fldpln --tag best   # maps: hits, false alarms, misses
 ```
 
 - Judge a set by its hold-out mean as well as its calibration mean. A gain under 0.01 MCC is no gain.
@@ -201,9 +205,10 @@ physical grounds. A default outside its range, or not among its choices, stops e
 - **Mistakes stop the run before anything starts,** with a message that names the line. Examples: a misspelt field,
   optimize without a range, a `when` naming no setting or a value it can't take, or a stand-in searched while its ARC argument is set
   directly.
-- **Another settings file:** `site-eval --settings my_study.yaml ...` uses it for any command (or set
-  `SITE_EVAL_SETTINGS`). Each run's settings are copied to `results/settings/<mapper>_<fingerprint>.yaml`, and the
-  fingerprint is stored with every evaluation.
+- **Every command names its settings file:** `site-eval --settings my_study.yaml ...`, or `-s`, before or after the
+  command. There is no default and no environment variable. The file's `results` is where that command reads and
+  writes. Each run's settings are copied to `<results>/settings/<mapper>_<fingerprint>.yaml`, and the fingerprint is
+  stored with every evaluation.
 - **See what a file gives:** `site-eval show settings [--section arc]` lists every argument, `show space` the
   searched ones, and `show params [SET] --site NAME` the exact arguments nencarta, ARC and curve2flood get at a site.
 
@@ -233,10 +238,10 @@ Ctrl-C stops a command cleanly:
 ### Run and score
 
 ```bash
-site-eval prepare --mapper fldpln            # once, and after changing nencarta, a site, or the nencarta/dem settings
-site-eval run --mapper fldpln                # the settings file's defaults, all sites, all stages
-site-eval run --mapper kernel --params '{"n_water": 0.05}' --sites Wabash Salamonie --keep --tag my_test
-site-eval run --mapper fldpln --params '{"Standard_Step": false}'      # any argument, searched or not
+site-eval -s settings.yaml prepare --mapper fldpln            # once, and after changing nencarta, a site, or the nencarta/dem settings
+site-eval -s settings.yaml run --mapper fldpln                # the settings file's defaults, all sites, all stages
+site-eval -s settings.yaml run --mapper kernel --params '{"n_water": 0.05}' --sites Wabash Salamonie --keep --tag my_test
+site-eval -s settings.yaml run --mapper fldpln --params '{"Standard_Step": false}'      # any argument, searched or not
 ```
 
 - `--params` overrides the settings file's values. It takes a JSON string or file that names arguments as the file
@@ -258,13 +263,13 @@ settings), so tables and figures never need a rerun.
 ### Optimize
 
 ```bash
-site-eval optimize optuna   --mapper fldpln --name tpe_1 --trials 1000 --jobs 3      # resumes by name
-site-eval optimize sobol    --mapper fldpln --n 1024
-site-eval optimize cma      --mapper fldpln --budget 600 --fixed '{"dvn": false}'
-site-eval optimize coord    --mapper fldpln --x0 G_plaus_fldpln
-site-eval optimize profile  --mapper fldpln --x0 G_plaus_fldpln --only n_water min_flood_depth
-site-eval optimize switches --mapper fldpln --bases G_plaus_fldpln
-site-eval optimize persite  --mapper fldpln --run r1 --base G_plaus_fldpln     # each site on its own
+site-eval -s settings.yaml optimize optuna   --mapper fldpln --name tpe_1 --trials 1000 --jobs 3      # resumes by name
+site-eval -s settings.yaml optimize sobol    --mapper fldpln --n 1024
+site-eval -s settings.yaml optimize cma      --mapper fldpln --budget 600 --fixed '{"dvn": false}'
+site-eval -s settings.yaml optimize coord    --mapper fldpln --x0 G_plaus_fldpln
+site-eval -s settings.yaml optimize profile  --mapper fldpln --x0 G_plaus_fldpln --only n_water min_flood_depth
+site-eval -s settings.yaml optimize switches --mapper fldpln --bases G_plaus_fldpln
+site-eval -s settings.yaml optimize persite  --mapper fldpln --run r1 --base G_plaus_fldpln     # each site on its own
 ```
 
 What they search, over what, and the defaults all come from the settings file (`site-eval show space`). The global
@@ -279,11 +284,11 @@ searches optimize the calibration mean and score the hold-out sites on every eva
 ### Choose what to calibrate
 
 ```bash
-site-eval sensitivity --mapper fldpln --dry-run      # the candidates and the number of runs
-site-eval sensitivity --mapper fldpln                # screening, then the collinearity test (FLDPLN: ~3 h on 30 workers)
-site-eval sensitivity --mapper fldpln --max-trajectories 80   # another round for those still undecided
-site-eval sensitivity --mapper fldpln --stage identify --prefer n_tree n_water   # rerun only the second step
-site-eval plot sensitivity --mapper fldpln
+site-eval -s settings.yaml sensitivity --mapper fldpln --dry-run      # the candidates and the number of runs
+site-eval -s settings.yaml sensitivity --mapper fldpln                # screening, then the collinearity test (FLDPLN: ~3 h on 30 workers)
+site-eval -s settings.yaml sensitivity --mapper fldpln --max-trajectories 80   # another round for those still undecided
+site-eval -s settings.yaml sensitivity --mapper fldpln --stage identify --prefer n_tree n_water   # rerun only the second step
+site-eval -s settings.yaml plot sensitivity --mapper fldpln
 ```
 
 The command answers two questions for one DEM and the calibration sites. It never looks at the hold-out sites.
@@ -356,40 +361,40 @@ physical grounds. `optimize switches` compares each searched switch flipped alon
 ### Display
 
 ```bash
-site-eval show runs                      # every run: calib / hold-out / all, failures, settings fingerprint
-site-eval show run my_test               # per site: score, bias, recall, precision, errors
-site-eval show sites                     # site statistics (stages, drainage area, flows, domain, reference extent)
-site-eval show site Salamonie            # one site: statistics, q_stage groups, its latest evaluations
-site-eval show studies                   # optimization progress per study / search
-site-eval show top --in-range           # best sets, optionally only those inside the settings file's ranges
-site-eval show importance                # parameter importance (surrogate model)
-site-eval show best --save best.json     # the best set inside the ranges
-site-eval show persite r1
-site-eval show params G_plaus_kernel     # a set and the nencarta arguments it becomes
+site-eval -s settings.yaml show runs                      # every run: calib / hold-out / all, failures, settings fingerprint
+site-eval -s settings.yaml show run my_test               # per site: score, bias, recall, precision, errors
+site-eval -s settings.yaml show sites                     # site statistics (stages, drainage area, flows, domain, reference extent)
+site-eval -s settings.yaml show site Salamonie            # one site: statistics, q_stage groups, its latest evaluations
+site-eval -s settings.yaml show studies                   # optimization progress per study / search
+site-eval -s settings.yaml show top --in-range           # best sets, optionally only those inside the settings file's ranges
+site-eval -s settings.yaml show importance                # parameter importance (surrogate model)
+site-eval -s settings.yaml show best --save best.json     # the best set inside the ranges
+site-eval -s settings.yaml show persite r1
+site-eval -s settings.yaml show params G_plaus_kernel     # a set and the nencarta arguments it becomes
 
-site-eval plot run my_test               # site scores
-site-eval plot compare tag_a tag_b       # per-site change between two runs (--other-mapper for a mapper comparison)
-site-eval plot stages my_test            # MCC and bias against stage rank
-site-eval plot sites [my_test]           # site statistics, or a run's scores against them
-site-eval plot site Wabash_River_at_Lafayette --tag my_test   # maps: hits, false alarms, misses per stage
-site-eval plot convergence | landscape   # optimization progress; value against every parameter
-site-eval plot persite r1
-site-eval plot sensitivity               # μ* with intervals; cosines of the sensitivity vectors
+site-eval -s settings.yaml plot run my_test               # site scores
+site-eval -s settings.yaml plot compare tag_a tag_b       # per-site change between two runs (--other-mapper for a mapper comparison)
+site-eval -s settings.yaml plot stages my_test            # MCC and bias against stage rank
+site-eval -s settings.yaml plot sites [my_test]           # site statistics, or a run's scores against them
+site-eval -s settings.yaml plot site Wabash_River_at_Lafayette --tag my_test   # maps: hits, false alarms, misses per stage
+site-eval -s settings.yaml plot convergence | landscape   # optimization progress; value against every parameter
+site-eval -s settings.yaml plot persite r1
+site-eval -s settings.yaml plot sensitivity               # μ* with intervals; cosines of the sensitivity vectors
 ```
 
 Figures go to `results/fig/` (or `--out`). Scores print at 2 decimals, because a change under 0.01 MCC counts as no
 change; use `--digits 4` for more.
 
-`site-eval --results DIR ...` points any command at another results folder. For example,
-`--results ~/scripts/results_v3` reads the October studies.
+`--results DIR` (before or after the command) replaces the settings file's results folder for one command. For
+example, `site-eval -s settings.yaml show studies --results ~/scripts/results_v3` reads the October studies.
 
 ## Layout
 
 | Module | Contents |
 |---|---|
-| `settings.yaml` (package root) | Every model argument, its default and its search range |
+| `settings.yaml`, `settings_usgs.yaml` (package root) | Every model argument, its default and its search range; the DEM; the results folder (FABDEM, USGS) |
 | `settings.py` | Reads and checks the settings file; the search space; a parameter set → nencarta's options and ARC / curve2flood / FLDPLN arguments; the stand-ins; fingerprints |
-| `config.py` | Paths (each overridable with `SITE_EVAL_SITES`, `SITE_EVAL_CACHE`, `SITE_EVAL_WORK`, `SITE_EVAL_RESULTS`) and the bankfull/baseflow rule |
+| `config.py` | Paths (the sites, cache and working copies, each overridable with `SITE_EVAL_SITES`, `SITE_EVAL_CACHE`, `SITE_EVAL_WORK`; the results folder is the settings file's) and the bankfull/baseflow rule |
 | `sites.py` | Site list, calibration / hold-out split (seed 12345), stages, flows, reference maps |
 | `params.py` | Parameter sets: presets, the conversion of older sets, the unit cube for the samplers, Manning's table |
 | `scoring.py` | Map-vs-reference metrics on the reference grid inside the boundary; site score and objective |
@@ -405,10 +410,11 @@ change; use `--digits 4` for more.
 From Python:
 
 ```python
-from site_evaluation import Runner, params, sites, results
+from site_evaluation import Runner, params, settings, sites, results
 if __name__ == "__main__":                     # the workers start with forkserver
+    settings.use("~/site_evaluation/settings.yaml")   # required first: the model arguments and the results folder
     with Runner("fldpln", workers=30) as r:
-        recs = r.evaluate({"n_water": 0.05}, sites.select_sites(["Wabash"]), tag="nb")   # settings.yaml for the rest
+        recs = r.evaluate({"n_water": 0.05}, sites.select_sites(["Wabash"]), tag="nb")   # the settings file for the rest
 ```
 
 The `site-eval` command works from any folder. A Python session or script started in `~` does not: there the
