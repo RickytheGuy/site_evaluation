@@ -359,7 +359,7 @@ fldpln_library:
   solver: {value: "iterative", optimize: true, choices: ["iterative", "exact"], mapper: fldpln}
   # Iterative solver: the least depth (m) a flooded pixel counts as when deciding where a spill stops.
   fldmn: {value: 0.1, optimize: false, range: [0.01, 1.0], log: true, mapper: fldpln, when: {solver: iterative}}
-  dh: {value: 0.5, optimize: true, range: [0.1, 1.0], mapper: fldpln, when: {solver: iterative}}   # depth step of the iterative solver (m)
+  dh: {value: 0.5, optimize: true, range: [0.1, 1.0], step: 0.25, mapper: fldpln, when: {solver: iterative}}   # depth step of the iterative solver (m)
   fldmx: {value: 25.0, optimize: false, mapper: fldpln, screen: false}        # largest depth to flood to (m). This is just a limit, we do not need to move it
   iterative_spill: {value: false, optimize: false, mapper: fldpln, when: {solver: iterative, dem.name: usgs}}   # keep spilling until the floodplain stops growing
   max_reach_length: {value: 5000.0, optimize: true, range: [500.0, 20000.0], log: true, mapper: fldpln}   # longest segment (m)

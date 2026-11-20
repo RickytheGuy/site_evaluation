@@ -72,10 +72,45 @@ def _sync_site(site: str, mapper: str) -> Path:
     return dst
 
 
+def _release_freed_memory() -> None:
+    """Hand the memory the C library holds free, the last run's arrays, back to the system (ARC's
+    release_freed_memory: malloc_trim on Linux; about 0.01 s)."""
+    try:
+        from arc import release_freed_memory
+    except ImportError:
+        return
+    release_freed_memory()
+
+
+def _reset_peak_memory() -> None:
+    """Start the process's peak resident memory (VmHWM) again from its current size (Linux; else nothing)."""
+    try:
+        with open("/proc/self/clear_refs", "w") as f:
+            f.write("5")
+    except OSError:
+        pass
+
+
+def _peak_memory_mb() -> float | None:
+    """The process's peak resident memory since _reset_peak_memory, in MB (Linux; else None)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return round(int(line.split()[1]) / 1024)
+    except OSError:
+        pass
+    return None
+
+
 def run_site(task: tuple) -> dict:
     """Worker: run one site with one complete parameter set, then score it. Never raises: a failed site comes back
-    with ok False and its error. keep: a folder to copy the site's flood maps into."""
+    with ok False and its error. keep: a folder to copy the site's flood maps into. The record also holds the run's
+    seconds and its worker's peak memory in MB (peak_mb: the most the process held during the run, its imports and
+    whatever it kept from earlier runs included)."""
     site, p, mapper, stages, keep = task
+    _release_freed_memory()
+    _reset_peak_memory()
     t0 = time.perf_counter()
     rec = {"site": site, "ok": False}
     try:
@@ -96,6 +131,7 @@ def run_site(task: tuple) -> dict:
     except Exception as e:
         rec["error"] = f"{type(e).__name__}: {e}"[:400]
     rec["seconds"] = round(time.perf_counter() - t0, 2)
+    rec["peak_mb"] = _peak_memory_mb()
     rec["slot"] = str(_SLOT)
     return rec
 
@@ -164,10 +200,12 @@ class Runner:
             raise ValueError(f"mapper must be one of {list(config.MAPPERS)}")
         pipeline.worker_environment()
         self.mapper = mapper
-        self.workers = workers or max((os.cpu_count() or 4) - 2, 1)
+        self.workers = workers or config.WORKERS
+        # A worker is replaced after config.WORKER_RUNS runs: the processes grow from run to run
         self.pool = ProcessPoolExecutor(self.workers, mp_context=mp.get_context("forkserver"),
                                         initializer=_init_worker,
-                                        initargs=(mapper, str(settings.current().path)))
+                                        initargs=(mapper, str(settings.current().path)),
+                                        max_tasks_per_child=config.WORKER_RUNS)
         self.archive = Archive(mapper)
         self._checked: set[str] = set()
         self._inflight, self._inflight_lock = 0, threading.Lock()
@@ -207,7 +245,7 @@ class Runner:
         self.check(site_list)
         p = params.complete(p, self.mapper)
         from concurrent.futures import as_completed
-        futures = {self.submit(s, p, stages, keep): s for s in site_list}
+        futures = {self.submit(s, p, stages, keep): s for s in sites.largest_first(site_list)}
         recs = {}
         for fut in as_completed(futures):
             s = futures[fut]

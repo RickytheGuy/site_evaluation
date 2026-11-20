@@ -29,13 +29,77 @@ CACHE_SETTINGS = ".settings.json"
 
 
 def worker_environment() -> None:
-    """One thread per worker for numba, BLAS, polars and arrow, and a fixed string hash: nencarta's make_land_cover
-    warps the ESA WorldCover tiles in the order of a Python set. Set before the worker processes start."""
+    """One thread per worker for numba, BLAS, polars and arrow, a fixed string hash (nencarta's make_land_cover
+    warps the ESA WorldCover tiles in the order of a Python set), two malloc arenas, and numba's cache folder for
+    this code (numba_cache_dir). Set before the worker processes start.
+
+    The arenas: glibc gives each thread that allocates an arena of its own, and a worker's native threads (polars,
+    GDAL and others) made about 70. The memory a run frees is scattered over them and isn't handed back, so a worker
+    grew with every run, the more the more its runs' settings varied: 0.6 GB to 1.6 GB in 80 runs of mixed sites
+    and settings (2026-11-20), and to 3.2 GB in four hours of the USGS screening. With two arenas the same 80 runs
+    stayed at 0.6-0.7 GB, and took no longer."""
     for var in ("NUMBA_NUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                 "POLARS_MAX_THREADS", "RAYON_NUM_THREADS", "NUMEXPR_NUM_THREADS", "GDAL_NUM_THREADS",
                 "ARROW_IO_THREADS", "OMP_THREAD_LIMIT"):
         os.environ[var] = "1"
     os.environ.setdefault("PYTHONHASHSEED", "0")
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+    os.environ["NUMBA_CACHE_DIR"] = str(numba_cache_dir())
+
+
+#: The packages whose numba functions the workers compile
+MODEL_PACKAGES = ("arc", "curve2flood", "nencarta")
+#: Unused numba cache folders older than this many days are removed (the newest few are always kept)
+NUMBA_KEEP_DAYS, NUMBA_KEEP_NEWEST = 14, 3
+
+
+def numba_cache_dir() -> Path:
+    """
+    numba's cache folder for the model code as it is now: config.NUMBA_ROOT/<key>, the key a hash of the numba and
+    Python versions and of the path, size and modification time of every .py file of MODEL_PACKAGES.
+
+    numba recompiles a cached function only when its own file changes, not when a jitted function it calls from
+    another file does. After an edit, a cached function can so run the old build of its callee against the new code:
+    on 2026-11-19 Harrisburg (USGS) segfaulted in ARC's bank smoothing because bathymetry/banks.py's cache still held
+    the hydraulics.py it was compiled with. A folder per version means any edit starts a cache of its own, which each
+    worker fills the first time it runs a site (about a minute). Old folders are pruned (NUMBA_KEEP_DAYS).
+    """
+    import hashlib
+    import importlib.metadata
+    import importlib.util
+    import platform
+    h = hashlib.sha1(f"{importlib.metadata.version('numba')} {platform.python_version()}".encode())
+    for name in MODEL_PACKAGES:
+        spec = importlib.util.find_spec(name)
+        if spec is None or not spec.submodule_search_locations:
+            h.update(f"{name}: missing".encode())
+            continue
+        for root in spec.submodule_search_locations:
+            for folder, dirs, files in os.walk(root):
+                dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+                for f in sorted(files):
+                    if f.endswith(".py"):
+                        st = os.stat(os.path.join(folder, f))
+                        h.update(f"{os.path.relpath(os.path.join(folder, f), root)} {st.st_size} "
+                                 f"{st.st_mtime_ns}\n".encode())
+    path = config.NUMBA_ROOT / h.hexdigest()[:16]
+    path.mkdir(parents=True, exist_ok=True)
+    os.utime(path)                                   # marks it in use, for the pruning
+    _prune_numba_caches(keep=path)
+    return path
+
+
+def _prune_numba_caches(keep: Path) -> None:
+    """Remove the numba cache folders of old code: those unused for NUMBA_KEEP_DAYS, beyond the newest few."""
+    try:
+        folders = sorted((p for p in config.NUMBA_ROOT.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+    except OSError:
+        return
+    cutoff = time.time() - NUMBA_KEEP_DAYS * 86400
+    for p in folders[NUMBA_KEEP_NEWEST:]:
+        if p != keep and p.parent == config.NUMBA_ROOT and p.stat().st_mtime < cutoff:
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def watershed_dict(site: str, p: dict, mapper: str, output_dir: Path, n_file: str | None,

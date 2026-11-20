@@ -258,7 +258,7 @@ def cmd_show(a):
 def cmd_sensitivity(a):
     from . import sensitivity, sites
     sensitivity.run(a.mapper, a.name, a.trajectories, a.seed, a.threshold, a.stage, a.candidates, a.identify, a.reference, a.step, a.gamma, a.prefer,
-                    sites.select_sites(a.sites) if a.sites else None, a.workers, a.jobs, a.dry_run, a.digits,
+                    sites.select_sites(a.sites) if a.sites else None, a.workers, a.dry_run, a.digits,
                     a.max_trajectories)
 
 
@@ -327,6 +327,8 @@ def cmd_plot(a):
 
 SETTINGS_HELP = "the settings file (required, before or after the command): model arguments, DEM, results folder"
 RESULTS_HELP = "a results folder instead of the settings file's, for this command"
+WORKERS_HELP = (f"worker processes (default {config.WORKERS}, one per core; past ~16 on this machine they share the "
+                "memory bandwidth and finish little sooner; each holds 0.6-2.5 GB)")
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="site-eval", description=__doc__,
@@ -357,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--params", help="preset, JSON file or JSON string (default: the settings file's defaults)")
     p.add_argument("--sites", nargs="*")
     p.add_argument("--stages", default="all", help="'all' (default) or k stages per site, evenly spread")
-    p.add_argument("--workers", type=int, default=30)
+    p.add_argument("--workers", type=int, default=config.WORKERS, help=WORKERS_HELP)
     p.add_argument("--tag", help="name of the run (default run_<date>_<time>)")
     p.add_argument("--keep", action="store_true", help="keep the flood maps (results/maps/<mapper>/<tag>)")
     p.add_argument("--quiet", action="store_true", help="only failed sites and the summary")
@@ -375,7 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
     def opt(name, help_):
         q = osub.add_parser(name, help=help_)
         common(q, digits=False)
-        q.add_argument("--workers", type=int, default=30)
+        q.add_argument("--workers", type=int, default=config.WORKERS, help=WORKERS_HELP)
         q.add_argument("--seed", type=int, default=0)
         return q
 
@@ -457,8 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
                                                             "identifiable (default 5; see the positive control)")
     p.add_argument("--prefer", nargs="*", help="keep these first in the identifiable subset (e.g. n over slope)")
     p.add_argument("--sites", nargs="*", help="default: the calibration sites")
-    p.add_argument("--workers", type=int, default=30)
-    p.add_argument("--jobs", type=int, default=4, help="parameter sets in flight")
+    p.add_argument("--workers", type=int, default=config.WORKERS,
+                   help=WORKERS_HELP + "; each always has a site to run (the parameter sets in flight aren't capped)")
     p.add_argument("--dry-run", action="store_true", help="list the candidates and the number of runs")
     p.set_defaults(func=cmd_sensitivity)
 

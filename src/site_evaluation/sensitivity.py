@@ -80,9 +80,10 @@ or only prints the report; the tables also go to CSV files beside it.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
-import threading
+import queue
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -236,36 +237,93 @@ class Study:
         self.specs = specs_of(self.header)
         self.sites: list[str] = self.header["sites"]
 
-    def run(self, points: list[dict], workers: int, jobs: int, log=print, desc: str = "runs") -> None:
-        """Run the points not run yet, jobs parameter sets at a time. Each finished one is saved at once, so a stopped
-        study continues where it stopped. The first Ctrl-C lets the running sets finish; a second stops at once."""
+    def run(self, points: list[dict], workers: int, log=print, desc: str = "runs") -> None:
+        """Run the points not run yet, keeping every worker busy: whenever fewer than two site runs per worker are
+        waiting or running, the next point's sites go in, largest DEM first. A point held up by one slow site so
+        doesn't leave the other workers idle, and the number of points in flight isn't capped. Each point is saved as
+        soon as all its sites have run, so a stopped study continues where it stopped. The first Ctrl-C starts no new
+        point and lets those in flight finish; a second stops at once."""
         todo = [pt for pt in points if pt["key"] not in self.rows]
         if not todo:
             return
+        from . import sites
         from .runner import Runner
-        lock = threading.Lock()
+        order = sites.largest_first(self.sites)
         log(f"[{_stamp()}] {len(todo)} runs of {len(self.sites)} sites ({len(points) - len(todo)} done before)")
         with Runner(self.mapper, workers) as runner, progress.Progress(len(todo), desc, "run", log) as bar:
-            def one(pt):
-                recs = runner.evaluate(pt["params"], self.sites, None, archive=False)
+            before = next((r["code"] for r in reversed(self.rows.values()) if r.get("code")), None)
+            if before and before != runner.archive.code:
+                changed = ", ".join(f"{k} {before.get(k)} -> {v}" for k, v in runner.archive.code.items()
+                                    if before.get(k) != v)
+                bar.write(f"note: the model code changed since the last saved run ({changed}); an effect between "
+                          "runs on either side of the change includes whatever the change did to the maps")
+            ended = queue.SimpleQueue()                 # a point's key each time one of its site runs ends
+            waiting = collections.deque(todo)
+            live: dict[str, dict] = {}                  # key -> {"pt", "futs": {site: future}, "left": site runs}
+            unfinished = 0                              # site runs submitted and not yet ended
+            limit = 2 * runner.workers
+
+            def feed() -> None:
+                nonlocal unfinished
+                while waiting and unfinished < limit:
+                    pt = waiting.popleft()
+                    entry = {"pt": pt, "futs": {}, "left": len(order)}
+                    live[pt["key"]] = entry
+                    unfinished += len(order)
+                    for site in order:
+                        fut = runner.submit(site, pt["params"])
+                        fut.add_done_callback(lambda _f, key=pt["key"]: ended.put(key))
+                        entry["futs"][site] = fut
+
+            def save(entry: dict) -> None:
+                pt = entry["pt"]
+                recs = {site: entry["futs"][site].result() for site in self.sites}
                 if not any(r.get("ok") for r in recs.values()):
                     errors = sorted({r.get("error", "") for r in recs.values()})[:3]
                     raise RuntimeError(f"every site failed at {pt['key']}: {errors}")
-                scores = {s: scoring.site_score(r) for s, r in recs.items()}
+                scores = {site: scoring.site_score(r) for site, r in recs.items()}
                 row = {**pt, "value": float(np.mean(list(scores.values()))),
-                       "sites": {s: round(v, 6) for s, v in scores.items()},
-                       "mcc": {s: r.get("mcc") or [] for s, r in recs.items()},
-                       "stages": {s: r.get("stages") or [] for s, r in recs.items()},
-                       "failed": [s for s, r in recs.items() if not r.get("ok")], "time": time.time()}
-                with lock:
-                    with open(self.path, "a") as f:
-                        f.write(json.dumps(row, default=float) + "\n")
-                    self.rows[pt["key"]] = row
-                bar.update()
+                       "sites": {site: round(v, 6) for site, v in scores.items()},
+                       "mcc": {site: r.get("mcc") or [] for site, r in recs.items()},
+                       "stages": {site: r.get("stages") or [] for site, r in recs.items()},
+                       "seconds": {site: r.get("seconds") for site, r in recs.items()},
+                       "peak_mb": {site: r.get("peak_mb") for site, r in recs.items()},
+                       "failed": [site for site, r in recs.items() if not r.get("ok")], "time": time.time(),
+                       "code": runner.archive.code}
+                with open(self.path, "a") as f:
+                    f.write(json.dumps(row, default=float) + "\n")
+                self.rows[pt["key"]] = row
+                bar.update(postfix=f"{len(live)} in flight")
+
+            def next_end() -> None:
+                """Wait for a site run to end; save its point once all the point's sites have run."""
+                nonlocal unfinished
+                while True:
+                    try:
+                        key = ended.get(timeout=1.0)    # a timeout, so Ctrl-C is seen at once
+                        break
+                    except queue.Empty:
+                        continue
+                unfinished -= 1
+                entry = live[key]
+                entry["left"] -= 1
+                if entry["left"] == 0:
+                    del live[key]
+                    save(entry)
 
             try:
-                progress.thread_map(one, todo, jobs, bar.write)
+                while waiting or live:
+                    feed()
+                    next_end()
             except KeyboardInterrupt:
+                waiting.clear()
+                if live:
+                    bar.write(f"Stopping: finishing the {len(live)} runs in flight (Ctrl-C again to stop now)")
+                    try:
+                        while live:
+                            next_end()
+                    except KeyboardInterrupt:
+                        pass
                 done = sum(pt["key"] in self.rows for pt in points)
                 bar.write(f"Stopped: {done} of {len(points)} runs are saved in {self.path}. The same command "
                           "continues from there.")
@@ -345,7 +403,7 @@ NEEDS_MORE = ("undecided", "undecided (sites)", "never active")
 
 
 def more_trajectories(study: Study, specs: dict, mapper: str, r: int, max_trajectories: int, threshold: float,
-                      workers: int, jobs: int, log=print) -> None:
+                      workers: int, log=print) -> None:
     """Rounds of more trajectories for the parameters that need them: run the rounds planned before (a stopped one
     continues), then, while some parameter is undecided (on the mean or the sites) or never active, and moved by
     fewer than max_trajectories trajectories, plan another round of r trajectories (fewer near the cap) that moves
@@ -356,7 +414,7 @@ def more_trajectories(study: Study, specs: dict, mapper: str, r: int, max_trajec
             pts = morris_design(study.names, 0, study.header["seed"], rd)
             for pt in pts:
                 pt["params"] = params.from_unit(pt["unit"], mapper, study.names, specs)
-            study.run(pts, workers, jobs, log, f"round {rd['round']}")
+            study.run(pts, workers, log, f"round {rd['round']}")
         counts = trajectory_counts(study)
         df = screening_table(study, threshold)
         need = set(df.loc[df["class"].isin(NEEDS_MORE), "parameter"])
@@ -676,7 +734,7 @@ def print_summary(df: pd.DataFrame, res: dict | None, threshold: float, counts: 
 def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int = 0, threshold: float = 0.01,
         stage: str = "both", only: list[str] | None = None, identify: list[str] | None = None,
         reference: str | None = None, step: float = 0.1, gamma_crit: float = 5.0, prefer: list[str] | None = None,
-        site_list: list[str] | None = None, workers: int = 30, jobs: int = 4, dry_run: bool = False,
+        site_list: list[str] | None = None, workers: int = 30, dry_run: bool = False,
         digits: int = 2, max_trajectories: int = 60, log=None) -> None:
     from . import sites
     log = log or (lambda *x: print(*x, flush=True))
@@ -711,8 +769,8 @@ def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int 
         design = morris_design(names, trajectories, seed)
         for pt in design:
             pt["params"] = params.from_unit(pt["unit"], mapper, names, specs)
-        study.run(design, workers, jobs, log, "screening")
-        more_trajectories(study, specs, mapper, trajectories, max_trajectories, threshold, workers, jobs, log)
+        study.run(design, workers, log, "screening")
+        more_trajectories(study, specs, mapper, trajectories, max_trajectories, threshold, workers, log)
     screened = complete_trajectories(study) > 0
     if not screened and not (stage == "identify" and identify):
         raise SystemExit("no complete trajectory yet: run the screening first (or name --identify parameters)")
@@ -735,7 +793,7 @@ def run(mapper: str, name: str | None = None, trajectories: int = 20, seed: int 
         ref = {**{k: S.default(k, mapper) for k in [*names, *control]}, **params.load(reference, mapper)}
         pts, skipped = local_design(ref, list(dict.fromkeys([*test, *control])), all_specs, mapper, step)
         skipped = {n: why for n, why in skipped.items() if n in test and (why != "a switch or choice" or identify)}
-        study.run(pts, workers, jobs, log, "collinearity")
+        study.run(pts, workers, log, "collinearity")
         tested = [n for n in test if any(pt["moved"] == n for pt in pts)]
         res = identifiability(study, pts[0]["ref"], tested, gamma_crit, prefer)
         print_identifiability(res, reference or "the settings file's defaults", step, gamma_crit, skipped, digits)

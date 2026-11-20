@@ -165,10 +165,55 @@ def contingency(flood: np.ndarray, ref: np.ndarray, domain: np.ndarray) -> tuple
     return tp, tn, fp, fn
 
 
+def _flooded(ds, threshold: float = 0) -> tuple[np.ndarray, np.ndarray | None]:
+    """binary_and_valid as booleans, with None for "every pixel is valid" (an integer raster without NoData)."""
+    band = ds.GetRasterBand(1)
+    arr = band.ReadAsArray()
+    nodata = band.GetNoDataValue()
+    valid = np.isfinite(arr) if np.issubdtype(arr.dtype, np.floating) else None
+    if nodata is not None and not (isinstance(nodata, float) and np.isnan(nodata)):
+        valid = arr != nodata if valid is None else np.logical_and(valid, arr != nodata, out=valid)
+    flooded = arr > threshold
+    if valid is not None:
+        np.logical_and(flooded, valid, out=flooded)
+    return flooded, valid
+
+
+def _same_grid_counts(floodmap, reference, boundary) -> tuple[int, int, int, int] | None:
+    """
+    contingency(*load_on_reference_grid(...)) in a third of the passes over the rasters, for a map file on the
+    reference's grid and a boundary that is None or an array: None otherwise (the caller then takes the general
+    path). Scoring is bound by memory bandwidth, which all the workers share, so the passes are what it costs.
+    """
+    if isinstance(floodmap, np.ndarray) or (boundary is not None and not isinstance(boundary, np.ndarray)):
+        return None
+    ref_ds, flood_ds = _open(reference), _open(floodmap)
+    if not _same_grid(flood_ds, ref_ds):
+        return None
+    ref, ref_valid = _flooded(ref_ds)
+    if boundary is not None and boundary.shape != ref.shape:
+        raise ValueError(f"Boundary shape {boundary.shape} is not the reference grid's {ref.shape}")
+    flood, flood_valid = _flooded(flood_ds)
+    domain = boundary if boundary is None or boundary.dtype == bool else boundary > 0
+    for valid in (ref_valid, flood_valid):
+        if valid is not None:
+            domain = valid if domain is None else np.logical_and(domain, valid)
+    if domain is not None:
+        np.logical_and(flood, domain, out=flood)
+        np.logical_and(ref, domain, out=ref)
+    total = flood.size if domain is None else int(np.count_nonzero(domain))
+    flooded, observed = int(np.count_nonzero(flood)), int(np.count_nonzero(ref))
+    tp = int(np.count_nonzero(np.logical_and(flood, ref, out=flood)))
+    fp, fn = flooded - tp, observed - tp
+    return tp, total - tp - fp - fn, fp, fn
+
+
 def score_map(floodmap, reference, boundary=None) -> dict[str, float]:
     """Every metric of one map against its reference; NaN when the domain has no flooded or no dry reference pixel."""
-    flood, ref, domain = load_on_reference_grid(floodmap, reference, boundary)
-    tp, tn, fp, fn = contingency(flood, ref, domain)
+    counts = _same_grid_counts(floodmap, reference, boundary)
+    if counts is None:
+        counts = contingency(*load_on_reference_grid(floodmap, reference, boundary))
+    tp, tn, fp, fn = counts
     if tp + fn == 0 or tn + fp == 0:
         return {k: float("nan") for k in STATS_NAMES}
     return metrics(tp, tn, fp, fn)

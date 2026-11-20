@@ -267,3 +267,17 @@ def boundary_raster(site: str, dem: str | None = None) -> Path | None:
 
 def dem_file(site: str, dem: str | None = None) -> Path:
     return site_dir(site) / "DEMs" / f"{dem or config.dem()}.tif"
+
+
+@lru_cache(maxsize=None)
+def _cells(path: str) -> int:
+    from osgeo import gdal
+    gdal.UseExceptions()
+    ds = gdal.Open(path)
+    return ds.RasterXSize * ds.RasterYSize
+
+
+def largest_first(site_list: list[str]) -> list[str]:
+    """The sites by their DEM's cell count, largest first (then by name). Submitted in this order, the slowest sites
+    start first, and a parameter set doesn't wait on a large site that started last."""
+    return sorted(site_list, key=lambda s: (-_cells(str(dem_file(s))), s))

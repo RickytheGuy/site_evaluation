@@ -48,7 +48,7 @@ site-eval -s settings.yaml run --mapper fldpln --tag defaults     # the score to
 
 ```bash
 site-eval -s settings.yaml sensitivity --mapper fldpln --dry-run  # the candidates and how many runs they take
-site-eval -s settings.yaml sensitivity --mapper fldpln            # about 3 h for FLDPLN on 30 workers (10 s a run), then rounds
+site-eval -s settings.yaml sensitivity --mapper fldpln            # FLDPLN: about 3 h on FABDEM, about 15 h on USGS 3DEP, then rounds
 ```
 
 It screens every candidate on the calibration sites, then tests the influential ones for collinearity. A candidate is
@@ -235,6 +235,31 @@ Ctrl-C stops a command cleanly:
 - **A run in the background** (`nohup site-eval ... > run.log 2>&1 &`): `kill -INT <pid>` acts like Ctrl-C. A plain
   `kill <pid>` stops it at once; its worker processes exit within seconds.
 
+### Speed and memory
+
+- **Workers.** `run`, `optimize` and `sensitivity` use a worker per core (32 here) unless `--workers` says otherwise.
+  On this machine (i9-13900: 8 performance cores of 2 threads, 16 efficiency cores, two memory channels) the runs are
+  bound by memory bandwidth: with every worker kept busy, USGS site runs went through at 1.27 a second on 8 workers,
+  1.50 on 12, 1.61 on 16 and 1.65 on 30. Past ~16 workers every core is busy but each run is slower by about as much,
+  so a study finishes only a few percent sooner. A fresh worker holds 0.6 GB between runs and 2.2 GB running
+  Harrisburg on USGS 3DEP.
+- **Workers that grow.** In the USGS screening of 2026-11-20 the median run peaked at 1.6 GB in the first 20 minutes
+  and at 3.2 GB four hours later (4.9 GB on Harrisburg), on the same sites and settings. Nothing was kept: glibc gives
+  each thread that allocates a malloc arena of its own, a worker's native threads (polars, GDAL, ...) made about 70,
+  and the memory a run freed stayed scattered over them, the more so the more the runs' settings varied. The workers
+  now get two arenas (`MALLOC_ARENA_MAX=2`, set in `pipeline.worker_environment`): over 8 parameter sets on 16
+  workers the median peak went from 0.88 to 1.27 GB with glibc's default and from 0.82 to 0.91 GB with two, in the same
+  time. As a guard, a worker is also replaced by a fresh process after 50 runs (`config.WORKER_RUNS`; about 2.7 s each
+  time), and every run starts by handing the memory the last one freed back to the system (ARC's
+  `release_freed_memory`).
+- **A USGS run** of a median site takes about 2.5 s alone and Harrisburg about 19 s (ARC 7 s, maps 4.5 s, FLDPLN
+  library 1.7 s, scoring 0.7 s); a few times that when every worker is busy. All 85 sites at the defaults: 28 s.
+- **numba's compiled code** is kept in `~/.cache/site_evaluation/numba/<code version>`, a folder for each version of
+  the ARC, curve2flood and nencarta sources. numba recompiles a cached function only when its own file changes, not
+  when a jitted function it calls from another file does, and such a stale build crashed Harrisburg (a segmentation
+  fault in ARC's bank smoothing, 2026-11-19). So the first run after any change to those sources compiles everything
+  again, about a minute per worker. Folders unused for two weeks are removed.
+
 ### Run and score
 
 ```bash
@@ -257,8 +282,8 @@ site-eval -s settings.yaml run --mapper fldpln --params '{"Standard_Step": false
 
 A site's score is its mean MCC over its stages. A run reports the mean over the calibration sites (the objective),
 over the 10 hold-out sites, and over all sites. Every evaluation is appended to `results/<mapper>_evals.jsonl`
-(parameters, each stage's MCC, CSI, bias, recall and precision, the code commits and a fingerprint of the fixed
-settings), so tables and figures never need a rerun.
+(parameters, each stage's MCC, CSI, bias, recall and precision, the run's seconds and peak memory, the code commits
+and a fingerprint of the fixed settings), so tables and figures never need a rerun.
 
 ### Optimize
 
@@ -285,13 +310,22 @@ searches optimize the calibration mean and score the hold-out sites on every eva
 
 ```bash
 site-eval -s settings.yaml sensitivity --mapper fldpln --dry-run      # the candidates and the number of runs
-site-eval -s settings.yaml sensitivity --mapper fldpln                # screening, then the collinearity test (FLDPLN: ~3 h on 30 workers)
+site-eval -s settings.yaml sensitivity --mapper fldpln                # screening, then the collinearity test (FLDPLN: ~3 h FABDEM, ~15 h USGS)
 site-eval -s settings.yaml sensitivity --mapper fldpln --max-trajectories 80   # another round for those still undecided
 site-eval -s settings.yaml sensitivity --mapper fldpln --stage identify --prefer n_tree n_water   # rerun only the second step
 site-eval -s settings.yaml plot sensitivity --mapper fldpln
 ```
 
 The command answers two questions for one DEM and the calibration sites. It never looks at the hold-out sites.
+
+Every worker is kept busy. Whenever fewer than two site runs per worker are waiting or running, the next parameter
+set's sites go in, largest DEM first, so a set held up by one slow site doesn't leave the other workers idle. The
+number of sets in flight isn't capped (Ricky, 2026-11-17): memory grows with the workers, and at worst every worker
+runs a large site at once (about 2.5 GB each for Harrisburg on USGS 3DEP). The first Ctrl-C finishes every set in flight.
+Each saved run also holds every site's seconds and its worker's peak memory (`seconds`, `peak_mb`) and the code
+commits. When a study continues on other model code than its last saved run, it prints a note: the code changes of
+2026-11-17 to 11-19 moved a few USGS sites by up to 0.08 MCC, and an effect between runs on either side of such a
+change includes it. Change the model code between studies, not during one.
 
 **1. Does the parameter matter?** This is a screening by elementary effects (Morris 1991, with μ* from Campolongo et
 al. 2007).
@@ -394,7 +428,7 @@ example, `site-eval -s settings.yaml show studies --results ~/scripts/results_v3
 |---|---|
 | `settings.yaml`, `settings_usgs.yaml` (package root) | Every model argument, its default and its search range; the DEM; the results folder (FABDEM, USGS) |
 | `settings.py` | Reads and checks the settings file; the search space; a parameter set → nencarta's options and ARC / curve2flood / FLDPLN arguments; the stand-ins; fingerprints |
-| `config.py` | Paths (the sites, cache and working copies, each overridable with `SITE_EVAL_SITES`, `SITE_EVAL_CACHE`, `SITE_EVAL_WORK`; the results folder is the settings file's) and the bankfull/baseflow rule |
+| `config.py` | Paths (the sites, cache and working copies, each overridable with `SITE_EVAL_SITES`, `SITE_EVAL_CACHE`, `SITE_EVAL_WORK`; the results folder is the settings file's; numba's cache), the default worker count and the bankfull/baseflow rule |
 | `sites.py` | Site list, calibration / hold-out split (seed 12345), stages, flows, reference maps |
 | `params.py` | Parameter sets: presets, the conversion of older sets, the unit cube for the samplers, Manning's table |
 | `scoring.py` | Map-vs-reference metrics on the reference grid inside the boundary; site score and objective |
@@ -413,7 +447,7 @@ From Python:
 from site_evaluation import Runner, params, settings, sites, results
 if __name__ == "__main__":                     # the workers start with forkserver
     settings.use("~/site_evaluation/settings.yaml")   # required first: the model arguments and the results folder
-    with Runner("fldpln", workers=30) as r:
+    with Runner("fldpln") as r:                 # a worker per core unless workers=...
         recs = r.evaluate({"n_water": 0.05}, sites.select_sites(["Wabash"]), tag="nb")   # the settings file for the rest
 ```
 
